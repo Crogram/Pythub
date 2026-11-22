@@ -1,0 +1,8 @@
+[app]
+name = "hello-pythub"
+entry = "main.py"
+version = "0.1.0"
+description = "Pythub 示例应用（GUI + 控制台）"
+author = "CROGRAM"
+requirements = []          # 第三方依赖，例如 ["requests"]
+windowed = false           # true: GUI 应用隐藏控制台黑框（exe 引导器 -mwindows）

@@ -1,10 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 block_cipher = None
-APP_ID = 'org.pythub.builder'
-APP_NAME = 'Pythub Builder'
-APP_NAME_DISPLAY = 'Pythub Builder'
-APP_APP = 'PythubBuilder.app'
+APP_ID = 'org.crogram.pythub'
+APP_NAME = 'Pythub'
+APP_NAME_DISPLAY = 'Pythub'
+APP_APP = 'Pythub.app'
 APP_VERSION = '1.1.0'
 APP_BUILD = 11
 APP_COPYRIGHT = 'Copyright © 2025 Crogram All Rights Reserved.'

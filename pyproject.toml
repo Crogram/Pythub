@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crogram-pythub"
+version = "0.1.1"
+description = "开源的 Python 应用打包工具：一条命令把 Python 应用打包成免装 Python、可直接运行的产物（跨平台、多 Python 版本、多架构），并支持发布到 PyPI"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+authors = [{ name = "CROGRAM" }]
+keywords = ["package", "bundle", "cross-platform", "pyinstaller", "zipapp", "pypi"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: X11 Applications",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Build Tools",
+]
+
+[project.urls]
+Homepage = "https://crogram.org"
+Repository = "https://github.com/crogram/pythub"
+Issues = "https://github.com/crogram/pythub/issues"
+
+[project.scripts]
+pythub = "pythub.cli:main"
+pythub-gui = "pythub.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+pythub = ["bootloader/*.c", "bootloader/*.h", "bootloader/miniz_LICENSE"]

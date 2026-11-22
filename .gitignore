@@ -130,3 +130,6 @@ dmypy.json
 
 # Test
 test/
+
+examples/*
+!examples/hello_app
