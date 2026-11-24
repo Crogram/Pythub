@@ -76,6 +76,12 @@ pythub build hello_app -p macos -f app --arch aarch64
 pythub build hello_app -p linux -f appimage
 pythub build hello_app -p linux -f run
 
+# 产物平铺在 dist/ 下（无第一级版本目录），
+# 应用版本/Python 版本/平台/架构差异直接体现在文件名上:
+#   dist/hello_app-0.1.0-3.12-windows-x86_64.exe
+#   dist/hello_app-0.1.0-3.11-macos-aarch64.app
+#   dist/hello_app-0.1.0-3.12-linux-x86_64.run
+
 # 本机三方引擎打包（真二进制，需安装对应工具）
 pythub build hello_app -p macos -f onefile --engine pyinstaller
 pythub build hello_app -p macos -f app --engine py2app
@@ -145,7 +151,7 @@ GUI 的「发布 PyPI」页同样可选择 dist 中的文件直接上传。
 
 ```bash
 pythub build --platform macos --arch x86_64 --python 3.11 --fmt pexe --mem ./hello_app
-# 产物: dist/hello_app-3.11-macos-x86_64/hello_app.mem.pexe  （直接运行，免装 Python）
+# 产物: dist/hello_app-0.1.0-3.11-macos-x86_64.mem.pexe  （直接运行，免装 Python）
 ```
 
 ## 打包引擎

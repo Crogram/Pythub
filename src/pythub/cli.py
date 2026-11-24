@@ -68,6 +68,8 @@ def cmd_build(args) -> int:
         "mem": getattr(args, "mem", False),
         "chmod": getattr(args, "chmod", False),
         "app_wrap": getattr(args, "app_wrap", False),
+        "rpm_engine": getattr(args, "rpm_engine", None),
+        "bundle_id": getattr(args, "bundle_id", None),
     }
 
     total = 0
@@ -277,12 +279,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "全程内存执行不落盘，产物后缀 .mem.exe / .mem.pexe")
     p.add_argument("--app-wrap", action="store_true",
                    help="mac 平台把 pexe 再次打包成 .app 壳（Finder 识别为应用，适合 GUI）")
+    p.add_argument("--bundle-id", default=None, dest="bundle_id",
+                   help="macOS .app 的 CFBundleIdentifier（pythub 引擎 app/dmg/pkg/"
+                        "app_wrap 壳与 PyInstaller/py2app 引擎均同步传递；"
+                        "空则自动生成 org.crogram.<name>）")
     p.add_argument("--chmod", action="store_true",
                    help="为 run/pexe/pyz 等可执行产物自动添加执行权限（chmod +x）")
     p.add_argument("--sign", action="store_true",
                    help="给 .exe 附加 Authenticode 签名（需 osslsigncode；无证书时自动自签）")
     p.add_argument("--sign-cert", default=None, help="签名证书 PEM 路径（配合 --sign-key）")
     p.add_argument("--sign-key", default=None, help="签名私钥 PEM 路径（配合 --sign-cert）")
+    p.add_argument("--rpm-engine", dest="rpm_engine", default=None,
+                   choices=["auto", "self", "rpmbuild"],
+                   help="rpm 包引擎: auto（默认，有 rpmbuild 则用之）/ self（自研，"
+                        "三端可交叉）/ rpmbuild（仅 mac/linux 构建机）")
     p.set_defaults(func=cmd_build)
 
     p = sub.add_parser("gui", help="打开可视化操作界面（默认后台运行，不占控制台）")
@@ -383,6 +393,7 @@ description = "Pythub 示例应用"
 author = "CROGRAM"
 requirements = []          # 第三方依赖，例如 ["requests"]
 windowed = false           # GUI 应用在 PyInstaller 引擎下隐藏控制台
+# bundle_id = "com.example.myapp"  # macOS .app 的 CFBundleIdentifier（留空自动生成）
 '''
 
 

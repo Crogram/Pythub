@@ -119,14 +119,40 @@ def cache_stats() -> dict:
     return stats
 
 
+def cache_max_bytes() -> int:
+    """缓存大小上限（bytes）: settings.json 的 cache.max_mb（单位 MB）。
+
+    未配置/非法值时回退 DEFAULT_CACHE_MAX_BYTES（4096 MB = 4GB）。"""
+    mb = load_settings().get("cache", {}).get("max_mb")
+    try:
+        mb = int(mb)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        mb = 0
+    if mb <= 0:
+        mb = DEFAULT_CACHE_MAX_BYTES >> 20
+    return mb << 20
+
+
+def set_cache_max_mb(mb: int, logger: Optional[logging.Logger] = None) -> None:
+    """设置缓存大小上限（MB）并持久化到 settings.json 的 cache.max_mb。"""
+    if mb <= 0:
+        raise ValueError("缓存上限必须为正整数（MB）")
+    settings = load_settings()
+    settings.setdefault("cache", {})["max_mb"] = mb
+    save_settings(settings)
+    if logger:
+        logger.info("缓存大小上限已设为 %d MB", mb)
+
+
 def prune_cache(max_bytes: Optional[int] = None) -> List[Path]:
     """把构建机缓存裁剪到大小上限（LRU: 按缓存条目 mtime 从旧到新删除）。
 
     条目 = runtimes/pyzlib/bootloader 下的各版本/md5 缓存目录；返回被删除
     的条目路径列表。不触碰运行时用户缓存（exe/、run/，由引导器自行清理）
-    与 settings/logs。"""
+    与 settings/logs。max_bytes 省略时读取 settings.json 的 cache.max_mb
+    （未配置则为默认 4GB）。"""
     if max_bytes is None:
-        max_bytes = DEFAULT_CACHE_MAX_BYTES
+        max_bytes = cache_max_bytes()
     if max_bytes <= 0:
         raise ValueError("max_bytes 必须为正数（防呆: 0 会清空全部缓存）")
     entries = []  # (mtime, path, size)
@@ -190,18 +216,37 @@ def download_file(
     dest: Path,
     logger: Optional[logging.Logger] = None,
     progress: Optional[Callable[[float], None]] = None,
+    expected_sha256: Optional[str] = None,
 ) -> Path:
-    """下载文件到指定路径，支持断点重试一次。"""
+    """下载文件到指定路径。
+
+    - 断点续传: 利用 .part 已有字节数发 HTTP Range 请求，从断点继续；
+      服务端不支持（返回非 206）时整段重下
+    - 最多尝试 3 次；HTTP 404/410 不重试（资源不存在，重试无意义）
+    - expected_sha256 给出时下载完成后校验，不匹配则删除产物并报错
+    """
+    import hashlib
+    import urllib.error
+
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
-    req = urllib.request.Request(url, headers={"User-Agent": "pythub/0.1"})
-
-    for attempt in (1, 2):
+    last_err: Optional[Exception] = None
+    for attempt in range(1, 4):
+        offset = tmp.stat().st_size if tmp.exists() else 0
+        headers = {"User-Agent": "pythub/0.1"}
+        if offset:
+            headers["Range"] = f"bytes={offset}-"
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(
+                    urllib.request.Request(url, headers=headers),
+                    timeout=60) as resp:
+                code = getattr(resp, "status", None) or resp.getcode()
+                resumed = bool(offset) and code == 206
                 total = int(resp.headers.get("Content-Length") or 0)
-                done = 0
-                with open(tmp, "wb") as f:
+                if resumed:
+                    total += offset
+                done = offset if resumed else 0
+                with open(tmp, "ab" if resumed else "wb") as f:
                     while True:
                         chunk = resp.read(CHUNK_SIZE)
                         if not chunk:
@@ -210,15 +255,33 @@ def download_file(
                         done += len(chunk)
                         if progress and total:
                             progress(done / total)
+            if expected_sha256:
+                h = hashlib.sha256()
+                with open(tmp, "rb") as f:
+                    for block in iter(lambda: f.read(1 << 20), b""):
+                        h.update(block)
+                actual = h.hexdigest()
+                if actual != expected_sha256:
+                    tmp.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        f"下载文件 sha256 校验失败\n"
+                        f"  URL: {url}\n  期望: {expected_sha256}\n  实际: {actual}")
             tmp.replace(dest)
             return dest
-        except Exception as e:  # noqa: BLE001
-            if attempt == 2:
+        except urllib.error.HTTPError as e:
+            if e.code in (404, 410):
                 tmp.unlink(missing_ok=True)
-                raise RuntimeError(f"下载失败: {url}\n{e}") from e
-            if logger:
-                logger.warning("下载中断，重试: %s (%s)", url, e)
-    raise RuntimeError("unreachable")
+                raise RuntimeError(f"资源不存在: {url} ({e.code})") from e
+            last_err = e
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+        if logger:
+            logger.warning(
+                "下载中断（第 %d/3 次），%s: %s (%s)",
+                attempt, "将断点续传" if tmp.exists() else "重新下载",
+                url, last_err)
+    tmp.unlink(missing_ok=True)
+    raise RuntimeError(f"下载失败: {url}\n{last_err}")
 
 
 def is_frozen_unix_executable(path: Path) -> bool:
@@ -287,14 +350,23 @@ def make_tar_gz(tar_path: Path, src_dir: Path) -> None:
 
 
 def safe_extract(archive: Path, dest: Path) -> None:
-    """安全解压 zip/tar（防路径穿越）。"""
+    """安全解压 zip/tar/tar.xz（防路径穿越）。"""
     dest.mkdir(parents=True, exist_ok=True)
     if archive.suffix == ".zip":
         with zipfile.ZipFile(archive) as zf:
             _check_members(zf.namelist())
             zf.extractall(dest)
     elif archive.name.endswith((".tar.gz", ".tgz")):
-        with tarfile.open(archive) as tf:
+        with tarfile.open(archive, "r:gz") as tf:
+            _check_members(tf.getnames())
+            tf.extractall(dest)
+    elif archive.name.endswith((".tar.xz", ".txz")):
+        # zig 等官方发布使用 tar.xz（stdlib lzma 解码）
+        with tarfile.open(archive, "r:xz") as tf:
+            _check_members(tf.getnames())
+            tf.extractall(dest)
+    elif archive.name.endswith(".tar.bz2"):
+        with tarfile.open(archive, "r:bz2") as tf:
             _check_members(tf.getnames())
             tf.extractall(dest)
     else:

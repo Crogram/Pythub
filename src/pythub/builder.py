@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,6 +46,17 @@ DEFAULT_ENGINE = "pythub"
 EXEC_SUFFIXES = {".pexe", ".pyz", ".run", ".exe", ".appimage"}
 
 
+def _tag(spec: "BuildSpec", arch: Optional[str] = None) -> str:
+    """产物文件名标注: {name}-{version}-{python}-{platform}-{arch}（需求 36）。
+
+    dist/ 下不再有第一级版本目录，所有最终产物平铺到 dist/，
+    应用版本/Python/平台/架构差异直接体现在文件名上。
+    应用版本统一去掉前导 v/V（如 v0.1.1 -> 0.1.1）。
+    """
+    ver = spec.version[1:] if spec.version[:1] in ("v", "V") else spec.version
+    return f"{spec.name}-{ver}-{spec.python}-{spec.platform}-{arch or spec.arch}"
+
+
 def _wrap_mac_app(pexe: Path, spec: "BuildSpec", logger: logging.Logger) -> Path:
     """把构建好的 mac pexe 包裹成最小 .app 壳（Finder 直接识别为应用）。
 
@@ -53,7 +66,9 @@ def _wrap_mac_app(pexe: Path, spec: "BuildSpec", logger: logging.Logger) -> Path
     经 Finder 启动的进程不挂接终端、stdout 不可见，适合 GUI 应用（CLI 请在
     终端运行或改用 .command 启动器）。
     """
-    app = pexe.parent / f"{spec.name}{'-mem' if spec.mem else '-pexe'}.app"
+    app = pexe.parent / (
+        f"{_tag(spec)}{'-mem' if spec.mem else '-pexe'}.app"
+    )
     if app.exists():
         shutil.rmtree(app)
     macos_dir = app / "Contents" / "MacOS"
@@ -61,7 +76,11 @@ def _wrap_mac_app(pexe: Path, spec: "BuildSpec", logger: logging.Logger) -> Path
     bin_name = pexe.name
     shutil.copy2(pexe, macos_dir / bin_name)
     (macos_dir / bin_name).chmod(0o755)
-    ident = "org.crogram." + "".join(
+    ident = (spec.bundle_id or "").strip()
+    # 防御: 仅接受合法 Bundle ID 字符，非法（如误传提示文案）回退自动生成
+    if ident and not re.fullmatch(r"[A-Za-z0-9.\-]+", ident):
+        ident = ""
+    ident = ident or "org.crogram." + "".join(
         ch if ch.isalnum() or ch in ".-" else "-" for ch in spec.name.lower()
     )
     info = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -125,6 +144,15 @@ class BuildSpec:
     app_wrap: bool = False      # mac 平台把构建好的 pexe 再次包裹成 .app 壳
                                 # （Finder 识别为应用，适合 GUI；原 .pexe 产物保留，
                                 #  见 _wrap_mac_app）
+    bundle_id: str = ""         # macOS .app 的 CFBundleIdentifier（pythub 引擎的
+                                # app/dmg/pkg 与 app_wrap 壳、PyInstaller/py2app
+                                # 引擎同步传递；空则自动生成 org.crogram.<name>）
+    description: str = ""       # 应用描述（deb 包 Description / 桌面入口 Comment）
+    maintainer: str = ""        # 维护者（deb 包 Maintainer，格式 "Name <email>"；
+                                # 空则回退 pythub.toml [app].author，再空用内置默认）
+    license: str = ""           # 许可证（rpm 包 License tag；空则 "Unknown"）
+    rpm_engine: str = "auto"    # rpm 包引擎: auto（有 rpmbuild 则用之）/self（自研，
+                                # 三端可交叉）/rpmbuild（仅 mac/linux 构建机）
 
     @property
     def target_fmt(self) -> str:
@@ -160,6 +188,11 @@ def spec_from_project(
         sign_key=str(cfg.get("sign_key", "")),
         chmod=bool(cfg.get("chmod", False)),
         app_wrap=bool(cfg.get("app_wrap", False)),
+        bundle_id=str(cfg.get("bundle_id", "") or ""),
+        description=str(cfg.get("description", "") or ""),
+        maintainer=str(cfg.get("maintainer") or cfg.get("author") or ""),
+        license=str(cfg.get("license", "") or ""),
+        rpm_engine=str(cfg.get("rpm_engine") or "auto"),
     )
 
 
@@ -467,15 +500,17 @@ def _build_mem(spec: BuildSpec, entry: Path, logger: logging.Logger) -> List[Pat
         # 保留符号链接（bin/python3 -> python3.X 等）：归档按链接存储
         shutil.copytree(runtime, bundle / "runtime", symlinks=True)
 
-        out_root = spec.output / f"{spec.name}-{spec.python}-{spec.platform}-{spec.arch}"
-        out_root.mkdir(parents=True, exist_ok=True)
-        dest = out_root / (f"{spec.name}.mem.exe" if spec.platform == "windows"
-                           else f"{spec.name}.mem.pexe")
+        spec.output.mkdir(parents=True, exist_ok=True)
+        dest = spec.output / (
+            f"{_tag(spec)}.mem.exe" if spec.platform == "windows"
+            else f"{_tag(spec)}.mem.pexe"
+        )
         if dest.exists():
             dest.unlink()
 
         logger.info("  mem 模式: 源码字节码内嵌、全程内存执行（不落盘）")
-        boot_src = mempack.boot_runner_source(entry_module).encode("utf-8")
+        boot_src = mempack.boot_runner_source(
+            entry_module, info=_appinfo_dict(spec)).encode("utf-8")
         payload = payload_path.read_bytes()
         if spec.platform == "windows":
             formats.make_exe(bundle, dest, spec.arch, spec.python, logger,
@@ -493,6 +528,53 @@ def _build_mem(spec: BuildSpec, entry: Path, logger: logging.Logger) -> List[Pat
         if spec.platform == "macos" and spec.app_wrap:
             return [dest, _wrap_mac_app(dest, spec, logger)]
         return [dest]
+
+
+# 需求 63: 打包/运行信息注入。
+# 方式: 不引入独立模块，直接在引导器中把信息挂到标准库 sys 模块上——
+#   sys.pythub_packaged = True   （标志: 由 pythub 打包）
+#   sys.pythub_info = {...}      （注入的信息字典，runtime 子字段动态探测）
+# 应用代码无需 import 任何东西即可访问:
+#   import sys
+#   if getattr(sys, "pythub_packaged", False):
+#       info = sys.pythub_info
+
+
+def _appinfo_dict(spec: "BuildSpec") -> dict:
+    """生成本次打包的静态信息字典（运行时字段由引导器动态探测补充）。"""
+    import platform as _platform
+    import pythub as _pkg
+
+    return {
+        "pythub_version": _pkg.__version__,
+        "app": {
+            "name": spec.name,
+            "version": spec.version,
+            "entry": spec.entry,
+            "engine": spec.engine,
+            "fmt": spec.fmt,
+        },
+        "target": {
+            "platform": spec.platform,
+            "arch": spec.arch,
+            "python": spec.python,
+            "mem": bool(spec.mem),
+        },
+        "build": {
+            "python": "%d.%d.%d" % sys.version_info[:3],
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "host_platform": sys.platform,      # 原生值: darwin/win32/linux
+            "host_os": {"darwin": "macos", "win32": "windows"}.get(
+                sys.platform, "linux"),         # 规范化: macos/windows/linux
+            "host_arch": {
+                "x86_64": "x86_64",
+                "amd64": "x86_64",
+                "i386": "x86",
+                "arm64": "aarch64",
+            }.get(_platform.machine().lower(), _platform.machine().lower()),
+        },
+        "project_dir": str(spec.project_dir),
+    }
 
 
 def _build_pyz(spec: BuildSpec, entry: Path, lib_dir: Optional[Path], pyz: Path) -> None:
@@ -515,6 +597,22 @@ _zp = os.path.dirname(os.path.abspath(__file__))
 _entry = {entry_rel!r}
 _lib = os.path.join(_zp, "lib")
 sys.path.insert(0, _zp)
+
+# Pythub 注入打包/运行信息（需求 63: sys.pythub_packaged / sys.pythub_info）
+sys.pythub_packaged = True
+sys.pythub_info = _PYTHUB_INFO_REPR_
+sys.pythub_info["runtime"] = {{
+    "python": "%d.%d.%d" % sys.version_info[:3],
+    "python_full": sys.version.split()[0],
+    "implementation": sys.implementation.name,
+    "executable": sys.executable,
+    "exe_dir": os.path.dirname(os.path.abspath(sys.executable)),
+    "app_origin": sys.argv[0] if sys.argv else "",
+    "source": os.path.join(_zp, _entry),
+    "source_on_disk": True,
+    "cache_dir": os.environ.get("PYTHUB_CACHE") or os.path.join(
+        os.path.expanduser("~"), ".cache", "pythub"),
+}}
 
 if os.path.isfile(_zp):
     # pyz 单文件模式
@@ -550,6 +648,8 @@ else:
 '''
     # 注意: 单文件模式里用到了 hashlib，统一顶部导入
     bootstrap = bootstrap.replace("import os, sys, runpy", "import os, sys, runpy, hashlib")
+    # 需求 63: 静态打包信息以字面量内嵌进引导器
+    bootstrap = bootstrap.replace("_PYTHUB_INFO_REPR_", repr(_appinfo_dict(spec)))
 
     files: List[Tuple[str, object, bool]] = []
     for rel in _project_files(spec.project_dir):
@@ -610,12 +710,15 @@ def _assemble(
 ) -> List[Path]:
     fmt = spec.target_fmt
     arch = spec.arch  # pexe 架构已在 build() 阶段解析为本机架构
-    out_root = spec.output / f"{spec.name}-{spec.python}-{spec.platform}-{arch}"
-    out_root.mkdir(parents=True, exist_ok=True)
+    # 需求 36: dist 下不再有第一级版本目录，最终产物直接平铺到 dist/，
+    # 应用版本/Python/平台/架构差异直接体现在文件名上
+    # （{name}-{version}-{python}-{platform}-{arch}，版本去前导 v/V）
+    out = spec.output
+    out.mkdir(parents=True, exist_ok=True)
     artifacts: List[Path] = []
 
     if fmt == "pyz":
-        dest = out_root / f"{spec.name}-{spec.python}-{spec.platform}-{spec.arch}.pyz"
+        dest = out / f"{_tag(spec)}.pyz"
         shutil.copy2(pyz, dest)
         set_executable(dest)
         return [dest]
@@ -640,20 +743,20 @@ def _assemble(
         set_executable(launcher)
 
     if fmt == "dir":
-        dest = out_root / spec.name
+        dest = out / _tag(spec)
         if dest.exists():
             shutil.rmtree(dest)
         shutil.copytree(bundle, dest, symlinks=True)
         return [dest]
 
     if fmt == "exe.zip":
-        dest = out_root / f"{spec.name}.exe.zip"
+        dest = out / f"{_tag(spec)}.exe.zip"
         if dest.exists():
             dest.unlink()
         return [formats.make_exe_zip(bundle, dest)]
 
     if fmt == "exe":
-        dest = out_root / f"{spec.name}.exe"
+        dest = out / f"{_tag(spec)}.exe"
         if dest.exists():
             dest.unlink()
         artifact = formats.make_exe(bundle, dest, spec.arch, spec.python, logger,
@@ -670,7 +773,7 @@ def _assemble(
         return [artifact]
 
     if fmt == "pexe":
-        dest = out_root / f"{spec.name}.pexe"
+        dest = out / f"{_tag(spec)}.pexe"
         if dest.exists():
             dest.unlink()
         artifact = formats.make_native_exe(bundle, dest, spec.platform, arch,
@@ -682,48 +785,74 @@ def _assemble(
         return [artifact]
 
     if fmt == "tar.gz":
-        dest = out_root / f"{spec.name}-{spec.platform}-{spec.arch}.tar.gz"
+        dest = out / f"{_tag(spec)}.tar.gz"
         if dest.exists():
             dest.unlink()
         make_tar_gz(dest, bundle)
         return [dest]
 
     if fmt == "run":
-        dest = out_root / f"{spec.name}.run"
+        dest = out / f"{_tag(spec)}.run"
         if dest.exists():
             dest.unlink()
         return [formats.make_run(bundle, dest, spec.name)]
 
+    if fmt == "deb" and spec.platform == "linux":
+        # Debian 包: bundle 铺 /opt/<pkg>/ + /usr/bin 软链，纯标准库交叉生成；
+        # 文件名沿用 Debian 规范（{name}_{version}-{release}_{arch}.deb，
+        # 版本/架构已在文件名标注，平台即 linux）
+        dest = out / formats.deb_file_name(spec.name, spec.version, arch)
+        if dest.exists():
+            dest.unlink()
+        return [formats.make_deb(
+            bundle, out,
+            name=spec.name, version=spec.version, arch=arch,
+            maintainer=spec.maintainer, description=spec.description,
+            windowed=spec.windowed,
+        )]
+
+    if fmt == "rpm" and spec.platform == "linux":
+        # RPM 包: 自研 cpio/header（三端可交叉）或 rpmbuild（mac/linux 构建机可选）；
+        # 文件名沿用 RPM 规范（{name}-{version}-{release}.{arch}.rpm）
+        return [formats.make_rpm(
+            bundle, out,
+            name=spec.name, version=spec.version, arch=arch,
+            maintainer=spec.maintainer, description=spec.description,
+            license=spec.license, windowed=spec.windowed,
+            engine=spec.rpm_engine,
+        )]
+
     if spec.platform == "macos":
         staging = work / "stage"
         staging.mkdir(parents=True)
-        app = formats.build_app_bundle(staging, spec.name, spec.version, runtime, pyz, logger)
+        app = formats.build_app_bundle(staging, spec.name, spec.version, runtime, pyz,
+                                       logger, bundle_id=spec.bundle_id)
         if fmt == "app":
-            dest = out_root / app.name
+            dest = out / f"{_tag(spec)}.app"
             if dest.exists():
                 shutil.rmtree(dest)
             shutil.copytree(app, dest, symlinks=True)
             return [dest]
         if fmt == "dmg":
-            dest = out_root / f"{spec.name}.dmg"
+            dest = out / f"{_tag(spec)}.dmg"
             if dest.exists():
                 dest.unlink()
             return [formats.make_dmg(staging, dest, spec.name)]
         if fmt == "pkg":
-            dest = out_root / f"{spec.name}-{spec.version}.pkg"
+            dest = out / f"{_tag(spec)}.pkg"
             if dest.exists():
                 dest.unlink()
             return [formats.make_pkg(staging, dest, spec.name, spec.version)]
 
     if fmt == "appimage" and spec.platform == "linux":
-        dest = out_root / f"{spec.name}-{spec.arch}.AppImage"
+        dest = out / f"{_tag(spec)}.AppImage"
         if dest.exists():
             dest.unlink()
         result = formats.make_appimage(work / "stage", dest, spec.name, runtime, pyz, logger)
         if result:
             return [result]
         logger.warning("未找到 appimagetool，降级为单文件 .run（自解压可执行，无需任何工具）。")
-        dest = out_root / f"{spec.name}.run"
+        dest = out / f"{_tag(spec)}.run"
         if dest.exists():
             dest.unlink()
         return [formats.make_run(bundle, dest, spec.name)]

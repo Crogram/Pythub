@@ -171,9 +171,52 @@ def _run_setup_script(spec: BuildSpec, work: Path, body: str,
 
 
 def _out_root(spec: BuildSpec) -> Path:
-    out = spec.output / f"{spec.name}-{spec.python}-{spec.platform}-{spec.arch}"
+    """三方引擎的内部构建目录（隐藏，构建后由 _finalize 平铺到 dist/）。
+
+    需求 36: dist/ 下不再有第一级版本目录，三方引擎先在隐藏目录内产出，
+    最终产物经 _finalize 重命名后平铺到 dist/。
+    """
+    out = spec.output / (
+        f".build-{spec.engine}-{_tag(spec)}"
+    )
     out.mkdir(parents=True, exist_ok=True)
     return out
+
+
+def _tag(spec: BuildSpec) -> str:
+    """产物文件名标注: {name}-{version}-{python}-{platform}-{arch}（需求 36）。
+
+    应用版本统一去掉前导 v/V（如 v0.1.1 -> 0.1.1）。
+    """
+    ver = spec.version[1:] if spec.version[:1] in ("v", "V") else spec.version
+    return f"{spec.name}-{ver}-{spec.python}-{spec.platform}-{spec.arch}"
+
+
+def _finalize(spec: BuildSpec, artifact: Optional[Path]) -> Optional[Path]:
+    """把三方引擎产物平铺重命名到 dist/ 下（需求 36）。
+
+    命名: 目录产物 -> dist/{name}-{version}-{python}-{platform}-{arch}/，
+    文件产物 -> dist/{tag}{原后缀}（如 .exe / .app）。
+    """
+    if artifact is None:
+        return None
+    spec.output.mkdir(parents=True, exist_ok=True)
+    tag = _tag(spec)
+    if artifact.is_dir():
+        dest = spec.output / tag
+        if dest.exists():
+            shutil.rmtree(dest)
+    else:
+        dest = spec.output / (tag + artifact.suffix)
+        if dest.exists():
+            dest.unlink()
+    shutil.move(str(artifact), str(dest))
+    # 构建目录已空则顺带移除
+    try:
+        artifact.parent.rmdir()
+    except OSError:
+        pass
+    return dest
 
 
 # ----------------------------------------------------------------- PyInstaller
@@ -196,6 +239,9 @@ def _build_pyinstaller(spec: BuildSpec, fmt: str, logger: logging.Logger) -> Lis
     ]
     if spec.windowed and sys.platform in ("darwin", "win32"):
         cmd.append("--windowed")
+    if sys.platform == "darwin" and spec.windowed and spec.bundle_id.strip():
+        # 与 pythub 引擎同步: macOS .app 自定义 CFBundleIdentifier
+        cmd.append(f"--osx-bundle-identifier={spec.bundle_id.strip()}")
     cmd += _engine_named_args(spec, "pyinstaller") + _engine_extra_args(spec, "pyinstaller")
     cmd.append(str((spec.project_dir / spec.entry).resolve()))
 
@@ -210,7 +256,7 @@ def _build_pyinstaller(spec: BuildSpec, fmt: str, logger: logging.Logger) -> Lis
         a = _resolve_artifact(out, [spec.name, f"{spec.name}.exe"])
     if not a:
         raise RuntimeError(f"未找到 PyInstaller 产物（输出目录: {out}）")
-    return [a]
+    return [_finalize(spec, a)]
 
 
 # ------------------------------------------------------------------- cx_Freeze
@@ -242,7 +288,7 @@ setup(
         )
     if not target.exists():
         raise RuntimeError(f"未找到 cx_Freeze 产物（输出目录: {out}）")
-    return [target]
+    return [_finalize(spec, target)]
 
 
 # ---------------------------------------------------------------------- Nuitka
@@ -279,13 +325,16 @@ def _build_nuitka(spec: BuildSpec, fmt: str, logger: logging.Logger) -> List[Pat
         a = _resolve_artifact(out, [f"{spec.name}.dist", exe_name])
     if not a:
         raise RuntimeError(f"未找到 Nuitka 产物（输出目录: {out}）")
-    return [a]
+    return [_finalize(spec, a)]
 
 
 # ------------------------------------------------------------------- setuptools
 
 def _build_setuptools(spec: BuildSpec, fmt: str, logger: logging.Logger) -> List[Path]:
-    out = _out_root(spec)
+    # wheel 文件名本身已含名称/版本/平台标注（dist 规范命名），
+    # 直接平铺到 dist/（需求 36）
+    out = spec.output
+    out.mkdir(parents=True, exist_ok=True)
     proj = spec.project_dir
 
     if (proj / "setup.py").is_file() or (proj / "pyproject.toml").is_file():
@@ -347,7 +396,7 @@ except ImportError:
     a = _resolve_artifact(out, [f"{spec.name}.exe"])
     if not a:
         raise RuntimeError(f"未找到 py2exe 产物（输出目录: {out}）")
-    return [a]
+    return [_finalize(spec, a)]
 
 
 # ----------------------------------------------------------------------- py2app
@@ -360,6 +409,9 @@ def _build_py2app(spec: BuildSpec, fmt: str, logger: logging.Logger) -> List[Pat
 
     icon = _engine_cfg(spec, "py2app").get("icon")
     opts = {"iconfile": str(_abs_path(spec.project_dir, icon))} if icon else {}
+    if spec.bundle_id.strip():
+        # 与 pythub 引擎同步: macOS .app 自定义 CFBundleIdentifier
+        opts["plist"] = {"CFBundleIdentifier": spec.bundle_id.strip()}
     body = f"""\
 from setuptools import setup
 setup(
@@ -377,6 +429,7 @@ setup(
     a = _resolve_artifact(out, [f"{spec.name}.app"])
     if not a:
         raise RuntimeError(f"未找到 py2app 产物（输出目录: {out}）")
+    return [_finalize(spec, a)]
     return [a]
 
 

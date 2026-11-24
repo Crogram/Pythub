@@ -1,10 +1,12 @@
-"""目标平台产物格式实现：启动器、.app、dmg、pkg、AppImage、单文件 .run、单文件 .exe。"""
+"""目标平台产物格式实现：启动器、.app、dmg、pkg、AppImage、单文件 .run、单文件 .exe、Debian/RPM 包。"""
 
 from __future__ import annotations
 
 import hashlib
 import io
 import logging
+import os
+import re
 import shutil
 import subprocess
 import tarfile
@@ -60,7 +62,7 @@ INFO_PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 <dict>
     <key>CFBundleName</key><string>{name}</string>
     <key>CFBundleDisplayName</key><string>{name}</string>
-    <key>CFBundleIdentifier</key><string>org.crogram.{name}</string>
+    <key>CFBundleIdentifier</key><string>{bundle_id}</string>
     <key>CFBundleExecutable</key><string>{name}</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>{version}</string>
@@ -81,8 +83,9 @@ def build_app_bundle(
     runtime_src: Path,
     pyz_src: Path,
     logger: Optional[logging.Logger] = None,
+    bundle_id: str = "",
 ) -> Path:
-    """组装 macOS .app Bundle。"""
+    """组装 macOS .app Bundle。bundle_id 为空则自动生成 org.crogram.<name>。"""
     app = dest / f"{name}.app"
     if app.exists():
         shutil.rmtree(app)
@@ -92,8 +95,16 @@ def build_app_bundle(
     macos_dir.mkdir(parents=True)
     res_dir.mkdir(parents=True)
 
+    ident = (bundle_id or "").strip()
+    # 防御: 仅接受合法 Bundle ID 字符，非法（如误传提示文案）回退自动生成
+    if ident and not re.fullmatch(r"[A-Za-z0-9.\-]+", ident):
+        ident = ""
+    ident = ident or "org.crogram." + "".join(
+        ch if ch.isalnum() or ch in ".-" else "-" for ch in name.lower()
+    )
     (contents / "Info.plist").write_text(
-        INFO_PLIST_TEMPLATE.format(name=name, version=version), encoding="utf-8"
+        INFO_PLIST_TEMPLATE.format(name=name, version=version, bundle_id=ident),
+        encoding="utf-8"
     )
     (contents / "PkgInfo").write_text("APPL????", encoding="utf-8")
     shutil.copy2(pyz_src, res_dir / "app.pyz")
@@ -226,3 +237,173 @@ def make_run(bundle_dir: Path, out: Path, name: str) -> Path:
         f.write(payload)
     set_executable(out)
     return out
+
+
+# ---------------------------------------------------------------- Debian 包 (.deb)
+
+# Debian 架构名映射（dpkg 惯例命名）
+DEB_ARCH_MAP = {"x86_64": "amd64", "aarch64": "arm64", "i686": "i386"}
+
+# dpkg 包名规范: 小写字母/数字 + . - +，且必须以字母数字开头
+_DEB_NAME_OK = re.compile(r"[^a-z0-9+.\-]+")
+
+
+def sanitize_deb_name(name: str) -> str:
+    pkg = _DEB_NAME_OK.sub("-", name.lower()).strip("-")
+    if not pkg or not pkg[0].isalnum():
+        pkg = f"pythub-{pkg or 'app'}"
+    return pkg
+
+
+def sanitize_deb_version(version: str) -> str:
+    """Debian 版本号允许 [A-Za-z0-9.+~:-]，其余字符替换；下划线习惯性替换为点。"""
+    ver = version.replace("_", ".")
+    ver = re.sub(r"[^A-Za-z0-9.+~:\-]+", "-", ver).strip("-")
+    return ver or "0.0.0"
+
+
+def deb_file_name(name: str, version: str, arch: str) -> str:
+    pkg = sanitize_deb_name(name)
+    ver = sanitize_deb_version(version)
+    deb_arch = DEB_ARCH_MAP.get(arch, arch)
+    return f"{pkg}_{ver}_{deb_arch}.deb"
+
+
+def make_deb(
+    bundle_dir: Path,
+    out_dir: Path,
+    *,
+    name: str,
+    version: str,
+    arch: str = "x86_64",
+    maintainer: str = "",
+    description: str = "",
+    section: str = "utils",
+    windowed: bool = False,
+) -> Path:
+    """组装 Debian 软件包（.deb），纯标准库实现（ar 归档 + tar.gz），无需 dpkg。
+
+    布局: bundle 内容 -> /opt/<pkg>/；/usr/bin/<name> 软链；GUI 应用附带
+    /usr/share/applications/<pkg>.desktop。control 含 md5sums 与 Installed-Size。
+    纯数据格式，任意主机平台均可交叉生成（与 .run 同属零工具链路线）。
+    """
+    pkg = sanitize_deb_name(name)
+    ver = sanitize_deb_version(version)
+    deb_arch = DEB_ARCH_MAP.get(arch, arch)
+    maintainer = maintainer.strip() or "Pythub Packaging <open@crogram.org>"
+    if "@" not in maintainer:
+        # Debian 规范要求 Maintainer 为 "Name <email>"，缺邮箱时补默认地址
+        maintainer = f"{maintainer} <open@crogram.org>"
+
+    # ---- data.tar.gz: /opt/<pkg>/ 文件树 + /usr/bin 软链 (+ GUI 桌面入口) ----
+    data_buf = io.BytesIO()
+    md5s: list = []
+    installed_size = 0
+
+    def _root(ti: tarfile.TarInfo) -> tarfile.TarInfo:
+        ti.uid = ti.gid = 0
+        ti.uname = ti.gname = "root"
+        ti.mtime = 0
+        return ti
+
+    with tarfile.open(fileobj=data_buf, mode="w:gz", format=tarfile.GNU_FORMAT) as tf:
+        for p in sorted(bundle_dir.rglob("*")):
+            arc = f"opt/{pkg}/{p.relative_to(bundle_dir).as_posix()}"
+            if p.is_symlink():
+                ti = _root(tf.gettarinfo(str(p), arcname=arc))
+                tf.addfile(ti)  # 链接按链接存储（md5sums 不登记链接）
+                continue
+            if p.is_dir():
+                ti = _root(tf.gettarinfo(str(p), arcname=arc))
+                ti.mode = 0o755
+                tf.addfile(ti)
+                continue
+            if not p.is_file():
+                continue
+            ti = _root(tf.gettarinfo(str(p), arcname=arc))
+            ti.mode = 0o755 if os.access(p, os.X_OK) else 0o644
+            with open(p, "rb") as f:
+                tf.addfile(ti, f)
+            installed_size += p.stat().st_size
+            md5s.append(f"{hashlib.md5(p.read_bytes()).hexdigest()}  {arc}")
+
+        # /usr/bin/<name> -> /opt/<pkg>/<name>（绝对软链，卸载时随包删除）
+        ti = tarfile.TarInfo(f"usr/bin/{name}")
+        ti.type = tarfile.SYMTYPE
+        ti.linkname = f"/opt/{pkg}/{name}"
+        ti.mode = 0o777
+        tf.addfile(_root(ti))
+
+        # GUI 应用提供桌面入口（CLI 工具不生成，避免菜单噪音）
+        if windowed:
+            desktop = (
+                "[Desktop Entry]\n"
+                "Type=Application\n"
+                f"Name={name}\n"
+                f"Exec=/usr/bin/{name}\n"
+                "Terminal=false\n"
+                f"Comment={(description or name).splitlines()[0]}\n"
+                "Categories=Utility;\n"
+            )
+            arc = f"usr/share/applications/{pkg}.desktop"
+            data = desktop.encode("utf-8")
+            ti = tarfile.TarInfo(arc)
+            ti.size = len(data)
+            ti.mode = 0o644
+            tf.addfile(_root(ti), io.BytesIO(data))
+            md5s.append(f"{hashlib.md5(data).hexdigest()}  {arc}")
+
+    # ---- control.tar.gz: control + md5sums ----
+    lines = [
+        f"Package: {pkg}",
+        f"Version: {ver}",
+        f"Architecture: {deb_arch}",
+        f"Maintainer: {maintainer}",
+        f"Installed-Size: {installed_size // 1024 + 1}",
+        f"Section: {section}",
+        "Priority: optional",
+    ]
+    desc = (description or f"{name} (packaged by pythub)").strip().replace("\r\n", "\n")
+    desc_lines = desc.split("\n")
+    lines.append(f"Description: {desc_lines[0]}")
+    for extra in desc_lines[1:]:
+        lines.append(" ." if not extra.strip() else f" {extra}")
+    control_text = "\n".join(lines) + "\n"
+
+    control_buf = io.BytesIO()
+    with tarfile.open(fileobj=control_buf, mode="w:gz", format=tarfile.GNU_FORMAT) as tf:
+        for member, data, mode in (
+            ("control", control_text.encode("utf-8"), 0o644),
+            ("md5sums", ("\n".join(md5s) + "\n").encode("utf-8"), 0o644),
+        ):
+            ti = tarfile.TarInfo(member)
+            ti.size = len(data)
+            ti.mode = mode
+            tf.addfile(_root(ti), io.BytesIO(data))
+
+    # ---- ar 归档: debian-binary + control.tar.gz + data.tar.gz ----
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / deb_file_name(name, version, arch)
+    if out.exists():
+        out.unlink()
+    with open(out, "wb") as f:
+        f.write(b"!<arch>\n")
+        for header_name, data in (
+            ("debian-binary", b"2.0\n"),
+            ("control.tar.gz", control_buf.getvalue()),
+            ("data.tar.gz", data_buf.getvalue()),
+        ):
+            # ar 成员头 60 字节: 名称16 + mtime12 + uid6 + gid6 + mode8 + size10 + "`\n"
+            f.write(f"{header_name:<16}{0:<12}{0:<6}{0:<6}{100644:<8}{len(data):<10}".encode())
+            f.write(b"`\n")
+            f.write(data)
+            if len(data) % 2:
+                f.write(b"\n")  # ar 成员按 2 字节对齐
+    return out
+
+
+def make_rpm(*args, **kwargs) -> Path:
+    """RPM 包（自研 cpio/header 三端交叉，或 rpmbuild 引擎）——惰性转发到 rpm_pack。"""
+    from pythub.rpm_pack import make_rpm as _make_rpm  # 规避循环导入
+
+    return _make_rpm(*args, **kwargs)

@@ -100,12 +100,58 @@ _ZIG_TARGETS = {
 }
 
 
+def _default_compiler() -> str:
+    """默认编译器设置（需求 37，工具管理页可改），auto/zig/mingw/cc。"""
+    from pythub.tools import default_compiler
+
+    return default_compiler()
+
+
 def find_zig() -> Optional[str]:
-    """查找 zig 工具链: PYTHUB_ZIG 环境变量优先，其次 PATH。"""
+    """查找 zig 工具链（多层回退）:
+
+    1. PYTHUB_ZIG 环境变量（可以是完整路径，也可以是可执行文件名）;
+    2. 当前进程 PATH（shutil.which）;
+    3. 常见安装位置兜底 —— macOS GUI 从 Dock/Finder 启动时进程 PATH 只有
+       /usr/bin:/bin:/usr/sbin:/sbin，不含 Homebrew 前缀；tarball 手动解压、
+       版本管理器安装的 zig 也常不在 PATH 中；
+    4. pythub 托管安装目录（工具管理页「安装 zig」的落位处）优先于 2/3。
+    """
     env = os.environ.get("PYTHUB_ZIG")
-    if env and Path(env).exists():
-        return env
-    return find_executable("zig")
+    if env:
+        found = shutil.which(env)  # 给的是命令名（如 "zig"）
+        if not found and Path(env).is_file() and os.access(env, os.X_OK):
+            found = env  # 给的是完整路径
+        if found:
+            return found
+
+    # pythub 托管安装（工具管理页下载安装的 zig）
+    managed = PYTHUB_CACHE_DIR / "tools" / "zig" / (
+        "zig.exe" if sys.platform == "win32" else "zig"
+    )
+    if managed.is_file() and os.access(managed, os.X_OK):
+        return str(managed)
+
+    found = shutil.which("zig")
+    if found:
+        return found
+
+    home = Path.home()
+    candidates = [
+        home / "zig" / "zig",            # 官方 tarball 默认解压位置
+        home / ".zig" / "zig",           # zig 版本管理器（zvm 等）
+        home / ".zigup" / "zig",         # zigup
+        home / ".local" / "bin" / "zig",
+        Path("/opt/homebrew/bin/zig"),   # Apple Silicon Homebrew
+        Path("/usr/local/bin/zig"),      # Intel Homebrew / 手动安装
+        Path("/opt/local/bin/zig"),      # MacPorts
+        Path("/usr/local/zig/zig"),
+        Path("/snap/bin/zig"),           # Linux snap
+    ]
+    for cand in candidates:
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    return None
 
 
 def _compile_flags(console: bool) -> list:
@@ -195,9 +241,12 @@ def ensure_bootloader(arch: str = "x86_64", console: bool = True, logger=None) -
     if out.exists():
         return out
 
+    # 默认编译器设置（需求 37）: 设为 zig 时优先用 zig cc 交叉编译
+    zig = find_zig()
+    prefer_zig = _default_compiler() == "zig"
     cc = find_executable(_CROSS_GCC[arch])
-    if not cc:
-        if find_zig():
+    if (prefer_zig and zig) or not cc:
+        if zig:
             return ensure_bootloader_target("windows", arch, console, logger)
         raise RuntimeError(
             f"生成 .exe 需要交叉编译器 {_CROSS_GCC[arch]} 或 zig（用于编译自研 PE 引导器）。\n"
@@ -406,13 +455,19 @@ def ensure_bootloader_native(console: bool = True, logger=None) -> Path:
     if out.exists():
         return out
 
-    cc = find_executable("cc") or find_executable("gcc") or find_executable("clang")
-    if not cc:
-        raise RuntimeError("需要 C 编译器 cc/gcc/clang（用于编译 POSIX 引导器）")
+    # 默认编译器设置（需求 37）: 设为 zig 时本机编译也用 zig cc
+    cmd: List[str]
+    if _default_compiler() == "zig" and find_zig():
+        cmd = [find_zig(), "cc"]  # type: ignore[list-item]
+    else:
+        cc = find_executable("cc") or find_executable("gcc") or find_executable("clang")
+        if not cc:
+            raise RuntimeError("需要 C 编译器 cc/gcc/clang（用于编译 POSIX 引导器）")
+        cmd = [cc]
     cache.mkdir(parents=True, exist_ok=True)
     tmp_out = cache / f"bootex.tmp-{os.getpid()}"
     proc = subprocess.run(
-        [cc, *flags, "-o", str(tmp_out), *[str(s) for s in sources]],
+        [*cmd, *flags, "-o", str(tmp_out), *[str(s) for s in sources]],
         capture_output=True,
         text=True,
     )
@@ -452,7 +507,8 @@ def ensure_bootloader_target(
     if not zig:
         raise RuntimeError(
             f"交叉编译 {platform}/{arch} 引导器需要 zig cc。\n"
-            "macOS: brew install zig | Ubuntu: snap install zig --classic\n"
+            "可在 GUI「工具管理」页一键安装 zig（pythub 自动托管、构建时自动识别）。\n"
+            "或手动安装: macOS: brew install zig | Ubuntu: snap install zig --classic\n"
             "或设环境变量 PYTHUB_ZIG 指向 zig 可执行文件。"
         )
     key = hashlib.md5(

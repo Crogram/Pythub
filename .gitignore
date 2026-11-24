@@ -26,6 +26,9 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+*.whl
+*.tar.gz
+
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -132,4 +135,4 @@ dmypy.json
 test/
 
 examples/*
-!examples/hello_app
+!examples/hello-pythub

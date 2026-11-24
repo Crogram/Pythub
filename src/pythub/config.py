@@ -73,6 +73,9 @@ def app_config(project_dir: Path, overrides: Optional[dict] = None) -> Dict[str,
         "mem": bool(cfg.get("mem", False)),
         "chmod": bool(cfg.get("chmod", False)),
         "app_wrap": bool(cfg.get("app_wrap", False)),
+        "license": cfg.get("license", ""),
+        "bundle_id": cfg.get("bundle_id", ""),  # macOS CFBundleIdentifier（空则自动）
+        "rpm_engine": cfg.get("rpm_engine", "auto"),  # rpm 引擎: auto/self/rpmbuild
     }
     for key, val in (overrides or {}).items():
         if val:

@@ -2,9 +2,13 @@
 
 - 选择打包的 Python 脚本/项目、目标平台、架构、Python 版本
 - 按平台列出可用文件类型（单文件/文件夹/平台专属格式）
-- 执行打包（后台线程，界面不卡顿）并实时输出日志
+- 执行打包（后台线程，界面不卡顿）
 - 打包成功弹窗提示产物路径
 - 发布打包好的应用/发行包到 PyPI
+- 工具管理（需求 37）: zig 安装/卸载/设默认编译器、Python 运行时下载/移除/设默认版本、
+  打包工具链状态检测；所有操作写入独立日志 logs/tools-YYYYMMDD.log
+- 日志独立弹窗查看（需求 40/41）: 打包日志（实时队列）与工具日志（文件）均为
+  独立弹窗、自动刷新，主窗口不再放置日志区
 """
 
 from __future__ import annotations
@@ -16,7 +20,9 @@ import subprocess
 import sys
 import threading
 import webbrowser
+from collections import deque
 from pathlib import Path
+from typing import Optional
 
 try:
     import tkinter as tk
@@ -46,6 +52,176 @@ class _QueueHandler(logging.Handler):
             self.handleError(record)
 
 
+# ------------------------------------------------ 日志弹窗（需求 40/41）
+
+
+class _LogWindow:
+    """独立日志查看弹窗: 暗色只读文本区 + 自动刷新。
+
+    - 打包日志（queue 模式）: 由 PythubGUI._poll 增量推送日志行（append_lines）
+    - 工具日志（file 模式）: 按日志文件路径定期重读（tools-YYYYMMDD.log）
+    """
+
+    COLORS = (("WARNING", "#c08000"), ("ERROR", "#e05555"), ("INFO", "#dcdcdc"))
+    MAX_LINES = 8000
+
+    def __init__(self, root: "tk.Tk", title: str, header: str,
+                 file_path: Optional[Path] = None, reload_ms: int = 1500):
+        self.win = tk.Toplevel(root)
+        self.win.title(title)
+        self.win.geometry("760x480")
+        self.file_path = file_path
+        self.reload_ms = reload_ms
+        self.bar = ttk.Frame(self.win)
+        self.bar.pack(fill="x", padx=6, pady=4)
+        ttk.Label(self.bar, text=header, foreground="#777").pack(side="left")
+        self.txt = tk.Text(self.win, bg="#141414", fg="#dcdcdc",
+                           state="disabled", wrap="none")
+        self.txt.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        for tag, color in self.COLORS:
+            self.txt.tag_config(tag, foreground=color)
+        if file_path is not None:
+            self.reload()
+            self._schedule_reload()
+
+    def append_lines(self, lines) -> None:
+        """外部增量追加日志行（queue 模式），超出上限后丢弃最旧行。"""
+        self.txt.configure(state="normal")
+        for text, tag in lines:
+            self.txt.insert("end", text, tag)
+        total = int(self.txt.index("end-1c").split(".")[0])
+        if total > self.MAX_LINES:
+            self.txt.delete("1.0", f"{total - self.MAX_LINES}.0")
+        self.txt.configure(state="disabled")
+        self.txt.see("end")
+
+    def reload(self) -> None:
+        """file 模式: 重读日志文件（按级别着色）。"""
+        if self.file_path is None:
+            return
+        try:
+            content = self.file_path.read_text(encoding="utf-8") \
+                if self.file_path.exists() else "（暂无日志 —— 今天还没有相关操作）"
+        except OSError as e:
+            content = f"（日志读取失败: {e}）"
+        self.txt.configure(state="normal")
+        self.txt.delete("1.0", "end")
+        for line in content.splitlines(keepends=True):
+            lvl = "INFO"
+            if "[WARNING]" in line or "[WARN]" in line:
+                lvl = "WARNING"
+            elif "[ERROR]" in line:
+                lvl = "ERROR"
+            self.txt.insert("end", line if line.endswith("\n") else line + "\n", lvl)
+        self.txt.configure(state="disabled")
+        self.txt.see("end")
+
+    def _schedule_reload(self) -> None:
+        """file 模式自动刷新: 周期性重读（定时器随窗口销毁自动取消）。"""
+        def tick():
+            self.reload()
+            self.win.after(self.reload_ms, tick)
+        self.win.after(self.reload_ms, tick)
+
+
+class _PlaceholderEntry(ttk.Entry):
+    """带 placeholder 提示文案的输入框（需求 43，tk/ttk 无原生支持）。
+
+    - 空内容且未聚焦时灰字显示提示文案
+    - 聚焦即清除提示、恢复正文颜色；失焦时若仍为空则重新显示
+    - 程序写入真实值（如选中项目后回填）自动清除提示状态
+    - 用 real_value() 取值: 显示占位文案时返回空串，避免把提示当成输入
+    """
+
+    def __init__(self, master, placeholder: str,
+                 textvariable: "tk.StringVar | None" = None, **kw):
+        super().__init__(master, textvariable=textvariable, **kw)
+        self._placeholder = placeholder
+        self._var = textvariable
+        self._showing = False
+        if self._var is not None:
+            self._var.trace_add("write", self._on_var_write)
+        self.bind("<FocusIn>", self._on_focus_in, add="+")
+        self.bind("<FocusOut>", self._on_focus_out, add="+")
+        self._refresh()
+
+    def set_placeholder(self, placeholder: str) -> None:
+        """外部更新占位文案（显示中的占位文案随之刷新；有真实值时不打扰）。"""
+        self._placeholder = placeholder
+        if self._showing:
+            if self._var is not None:
+                self._var.set(self._placeholder)
+            else:
+                self.delete(0, "end")
+                self.insert(0, self._placeholder)
+
+    # ---- 状态维护 ----
+
+    def _refresh(self):
+        val = self._var.get() if self._var is not None else self.get()
+        if val:
+            if self._showing:  # 外部写入了真实值
+                self._showing = False
+                self.configure(foreground="#000000")
+            return
+        if not self._showing and not self._has_focus():
+            self._set_placeholder()
+
+    def _set_placeholder(self):
+        self._showing = True
+        self.configure(foreground="#999999")
+        if self._var is not None:
+            self._var.set(self._placeholder)  # trace 中因 _showing 已置位而跳过
+        else:
+            self.delete(0, "end")
+            self.insert(0, self._placeholder)
+
+    def _on_var_write(self, *_):
+        if self._var is None:
+            return
+        val = self._var.get()
+        if self._showing:
+            if val == self._placeholder:
+                return  # 占位文案自身写入
+            self._showing = False
+            self.configure(foreground="#000000")
+            if not val and not self._has_focus():
+                # 外部清空（如更换项目重置输入框）: 恢复占位显示
+                self._set_placeholder()
+            return
+        if not val and not self._has_focus():
+            self._set_placeholder()
+
+    def _on_focus_in(self, _e=None):
+        if self._showing:
+            self._showing = False
+            if self._var is not None:
+                self._var.set("")
+            else:
+                self.delete(0, "end")
+            self.configure(foreground="#000000")
+
+    def _on_focus_out(self, _e=None):
+        val = self._var.get() if self._var is not None else self.get()
+        if not val.strip() and not self._showing:
+            self._set_placeholder()
+
+    def _has_focus(self) -> bool:
+        try:
+            return bool(self.focus_get() is self)
+        except KeyError:  # 窗口销毁瞬间
+            return False
+
+    # ---- 取值 ----
+
+    def real_value(self) -> str:
+        """显示占位文案时返回空串，其余返回当前内容。"""
+        if self._showing:
+            return ""
+        val = self._var.get() if self._var is not None else self.get()
+        return "" if val == self._placeholder else val
+
+
 class PythubGUI:
     def __init__(self, root: "tk.Tk", log_queue: "queue.Queue"):
         self.root = root
@@ -55,32 +231,33 @@ class PythubGUI:
         self.last_dir = Path.home()
 
         root.title("Pythub")
-        root.geometry("880x680")
+        root.geometry("880x666")
+        root.minsize(880, 666)
 
         nb = ttk.Notebook(root)
         self.nb = nb
         nb.pack(fill="both", expand=True, padx=8, pady=(8, 4))
         self.tab_build = ttk.Frame(nb)
         self.tab_publish = ttk.Frame(nb)
+        self.tab_tools = ttk.Frame(nb)
         self.tab_settings = ttk.Frame(nb)
         self.tab_about = ttk.Frame(nb)
-        nb.add(self.tab_build, text="  打包  ")
-        nb.add(self.tab_publish, text="  发布 PyPI  ")
-        nb.add(self.tab_settings, text="  设置  ")
-        nb.add(self.tab_about, text="  关于  ")
+        nb.add(self.tab_build, text="打包")
+        nb.add(self.tab_publish, text="发布")
+        nb.add(self.tab_tools, text="工具管理")
+        nb.add(self.tab_settings, text="设置")
+        nb.add(self.tab_about, text="关于")
         self._build_tab_build()
         self._build_tab_publish()
+        self._build_tab_tools()
         self._build_tab_settings()
         self._build_tab_about()
         self._build_menubar()
 
-        self.log = tk.Text(root, height=15, state="disabled",
-                           bg="#141414", fg="#dcdcdc")
-        self.log.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        for tag, color in (("WARNING", "#c08000"), ("ERROR", "#e05555"), ("INFO", "#dcdcdc")):
-            self.log.tag_config(tag, foreground=color)
-        self.log.delete("1.0", "end")  # 清掉默认空行，首条日志从第 1 行开始
-        nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        # 需求 41: 主窗口不再放置日志区，日志改为独立弹窗查看
+        self._log_buffer: "deque" = deque(maxlen=8000)  # (text, tag) 环形缓冲
+        self._build_log_win: Optional[_LogWindow] = None   # 打包日志弹窗（单例）
+        self._tools_log_win: Optional[_LogWindow] = None   # 工具日志弹窗（单例）
         root.after(100, self._poll)
 
     # ------------------------------------------------ 菜单栏
@@ -105,6 +282,8 @@ class PythubGUI:
                            command=lambda: self._select_tab(self.tab_publish))
         m_func.add_command(label="设置", accelerator="⌘3",
                            command=lambda: self._select_tab(self.tab_settings))
+        m_func.add_command(label="工具管理", accelerator="⌘4",
+                           command=lambda: self._select_tab(self.tab_tools))
         m_func.add_separator()
         m_func.add_command(label="关于 Pythub",
                            command=lambda: self._select_tab(self.tab_about))
@@ -138,20 +317,12 @@ class PythubGUI:
         self.root.bind("<Command-1>", lambda _e: self._select_tab(self.tab_build))
         self.root.bind("<Command-2>", lambda _e: self._select_tab(self.tab_publish))
         self.root.bind("<Command-3>", lambda _e: self._select_tab(self.tab_settings))
-
-    # ------------------------------------------------ 标签切换
-
-    def _on_tab_changed(self, _event=None):
-        """切到"关于"页时隐藏底部日志区，切回其他页时恢复（问题9）。"""
-        if self.nb.select() == str(self.tab_about):
-            self.log.pack_forget()
-        else:
-            self.log.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.root.bind("<Command-4>", lambda _e: self._select_tab(self.tab_tools))
 
     # ------------------------------------------------ 日志
 
     def _poll(self):
-        """主线程定时取出队列日志并显示（批量插入，保证界面流畅）。"""
+        """主线程定时取出队列日志 -> 环形缓冲；打包日志弹窗打开时增量显示（需求 41）。"""
         lines = []
         try:
             for _ in range(200):
@@ -161,15 +332,13 @@ class PythubGUI:
         except queue.Empty:
             pass
         if lines:
-            self.log.configure(state="normal")
-            for text, tag in lines:
-                self.log.insert("end", text, tag)
-            # 限制日志区行数，避免文本框过大导致整块重排缓慢（问题10）
-            total = int(self.log.index("end-1c").split(".")[0])
-            if total > 5000:
-                self.log.delete("1.0", f"{total - 5000}.0")
-            self.log.configure(state="disabled")
-            self.log.see("end")
+            self._log_buffer.extend(lines)
+            win = self._build_log_win
+            if win is not None:
+                if win.win.winfo_exists():
+                    win.append_lines(lines)
+                else:
+                    self._build_log_win = None
         self.root.after(120, self._poll)
 
     # ------------------------------------------------ 打包页
@@ -182,16 +351,55 @@ class PythubGUI:
 
         ttk.Label(frm, text="项目目录:").grid(row=0, column=0, sticky="e", padx=4, pady=4)
         self.var_project = tk.StringVar()
-        ttk.Entry(frm, textvariable=self.var_project).grid(row=0, column=1, sticky="we", padx=4)
+        self.ent_project = _PlaceholderEntry(
+            frm, "选择项目目录，如 ~/Projects/hello_app（含 pythub.toml 或入口脚本）",
+            self.var_project)
+        self.ent_project.grid(row=0, column=1, sticky="we", padx=4)
         ttk.Button(frm, text="浏览...", command=self._pick_project).grid(row=0, column=2, padx=4)
+        ttk.Button(frm, text="打开",
+                   command=lambda: self._open_folder_from(self.ent_project, "项目目录")
+                   ).grid(row=0, column=3, padx=(0, 4))
 
         ttk.Label(frm, text="入口脚本:").grid(row=1, column=0, sticky="e", padx=4, pady=4)
-        self.var_entry = tk.StringVar(value="main.py")
-        ttk.Entry(frm, textvariable=self.var_entry).grid(row=1, column=1, sticky="we", padx=4)
+        self.var_entry = tk.StringVar(value="")
+        self.ent_entry = _PlaceholderEntry(
+            frm, "如 main.py（留空默认 main.py）", self.var_entry)
+        self.ent_entry.grid(row=1, column=1, sticky="we", padx=4)
 
         ttk.Label(frm, text="应用名称:").grid(row=2, column=0, sticky="e", padx=4, pady=4)
-        self.var_name = tk.StringVar(value="app")
-        ttk.Entry(frm, textvariable=self.var_name).grid(row=2, column=1, sticky="we", padx=4)
+        self.var_name = tk.StringVar(value="")
+        self.ent_name = _PlaceholderEntry(
+            frm, "如 hello_app（留空默认 app；选项目后自动读取 pythub.toml）",
+            self.var_name)
+        self.ent_name.grid(row=2, column=1, sticky="we", padx=4)
+
+        # 需求 42: 输出目录与打包产物展示上移，紧跟应用名称
+        ttk.Label(frm, text="输出目录:").grid(row=3, column=0, sticky="e", padx=4, pady=4)
+        self.var_output = tk.StringVar(value="")
+        # 需求 43: 「留空默认为...」提示移入 placeholder
+        self.ent_output = _PlaceholderEntry(frm, "留空默认为 <项目>/dist", self.var_output)
+        self.ent_output.grid(row=3, column=1, sticky="we", padx=4)
+        ttk.Button(frm, text="浏览...", command=self._pick_output).grid(row=3, column=2, padx=4)
+        ttk.Button(frm, text="打开",
+                   command=lambda: self._open_folder_from(self.ent_output, "输出目录")
+                   ).grid(row=3, column=3, padx=(0, 4))
+
+        # macOS .app 的 CFBundleIdentifier（pythub 引擎与 PyInstaller/py2app 均同步）
+        ttk.Label(frm, text="应用标识:").grid(row=4, column=0, sticky="e", padx=4, pady=4)
+        self.var_bundle_id = tk.StringVar(value="")
+        self.ent_bundle_id = _PlaceholderEntry(
+            frm, "如 com.example.myapp（macOS .app 标识，留空自动生成 org.crogram.<名称>）",
+            self.var_bundle_id)
+        self.ent_bundle_id.grid(row=4, column=1, columnspan=3, sticky="we", padx=4)
+
+        # ---- 打包产物展示区（需求 42: 紧跟输出目录）----
+        self.frm_result = ttk.LabelFrame(f, text="打包产物", padding=6)
+        self.frm_result.pack(fill="x", padx=8, pady=(0, 8))
+        self._result_rows: list = []
+        self._result_vars: list = []  # 保持 StringVar 引用，防止被 GC 后输入框清空
+        self._last_artifacts: list = []
+        self._last_output_dir: Path | None = None
+        self._show_result_hint()
 
         opt = ttk.Frame(f)
         opt.pack(fill="x", padx=8, pady=6)
@@ -214,7 +422,8 @@ class PythubGUI:
                      state="readonly", width=10).grid(row=1, column=1, sticky="w", padx=6)
 
         ttk.Label(opt, text="Python 版本:").grid(row=1, column=2, sticky="e", padx=4)
-        self.var_py = tk.StringVar(value="3.12")
+        from pythub.tools import default_python as _default_python
+        self.var_py = tk.StringVar(value=_default_python())  # 需求 37: 默认运行版本可在工具管理页设置
         ttk.Combobox(opt, textvariable=self.var_py, values=list(SUPPORTED_PYTHON),
                      state="readonly", width=8).grid(row=1, column=3, sticky="w", padx=6)
 
@@ -276,19 +485,25 @@ class PythubGUI:
             variable=self.var_app_wrap).grid(
             row=9, column=1, columnspan=4, sticky="w", padx=6)
 
+        # rpm 包引擎选择（需求 36: mac/linux 构建机可选自研或 rpmbuild）
+        ttk.Label(opt, text="RPM 引擎:").grid(row=10, column=0, sticky="e", padx=4, pady=2)
+        self.var_rpm_engine = tk.StringVar(value="auto")
+        ttk.Combobox(opt, textvariable=self.var_rpm_engine,
+                     values=["auto", "self", "rpmbuild"],
+                     state="readonly", width=10).grid(row=10, column=1, sticky="w", padx=6)
+        ttk.Label(opt, text="auto=有 rpmbuild 则用；self=自研（三端可交叉）；"
+                           "rpmbuild=仅 mac/linux 构建机", foreground="#777").grid(
+            row=10, column=2, columnspan=3, sticky="w")
+
         self.var_status = tk.StringVar(value="就绪")
         ttk.Label(f, textvariable=self.var_status, foreground="#367bf0").pack(padx=8, anchor="w")
-        self.btn_build = ttk.Button(f, text="开始打包", command=self._start_build)
-        self.btn_build.pack(padx=8, pady=6, anchor="w")
-
-        # ---- 打包产物展示区（常驻主界面：左文案 / 中路径输入框 / 右按钮）----
-        self.frm_result = ttk.LabelFrame(f, text="打包产物", padding=6)
-        self.frm_result.pack(fill="x", padx=8, pady=(0, 8))
-        self._result_rows: list = []
-        self._result_vars: list = []  # 保持 StringVar 引用，防止被 GC 后输入框清空
-        self._last_artifacts: list = []
-        self._last_output_dir: Path | None = None
-        self._show_result_hint()
+        row_bb = ttk.Frame(f)
+        row_bb.pack(padx=8, pady=6, anchor="w")
+        self.btn_build = ttk.Button(row_bb, text="开始打包", command=self._start_build)
+        self.btn_build.pack(side="left")
+        # 需求 41: 打包日志按钮跟在「开始打包」按钮后面
+        ttk.Button(row_bb, text="查看打包日志",
+                   command=self._show_build_log).pack(side="left", padx=6)
 
     def _clear_result_rows(self):
         for w in self._result_rows:
@@ -342,13 +557,9 @@ class PythubGUI:
     def _show_artifacts(self, artifacts: list, output_dir):
         self._last_artifacts = list(artifacts)
         self._last_output_dir = Path(output_dir)
+        # 需求 42: 打包完成后回填实际输出目录到上方输入框
+        self.var_output.set(str(self._last_output_dir))
         self._clear_result_rows()
-        # 输出目录行：右侧 [打开输出目录] [复制路径]
-        self._add_result_row(
-            "输出目录", self._last_output_dir,
-            [("打开输出目录", self._open_output_dir),
-             ("复制路径", lambda: self._copy_to_clipboard(self._last_output_dir))],
-        )
         # 每个产物一行：右侧 [复制路径]
         for i, a in enumerate(artifacts, 1):
             self._add_result_row(
@@ -391,18 +602,48 @@ class PythubGUI:
             return
         self.last_dir = Path(d)
         self.var_project.set(d)
+        # 更换项目后，入口脚本/应用名称/输出目录一律重置为新项目的值:
+        # pythub.toml 存在则读取其配置，否则清空（显示 placeholder）
+        cfg = None
         if (Path(d) / "pythub.toml").exists():
             from pythub.config import app_config
 
             cfg = app_config(Path(d))
-            self.var_name.set(cfg["name"])
-            self.var_entry.set(cfg["entry"])
+        self.var_name.set(cfg["name"] if cfg else "")
+        self.var_entry.set(cfg["entry"] if cfg else "")
+        self.var_output.set(str(Path(d) / "dist"))
+        self.var_bundle_id.set(cfg["bundle_id"] if cfg else "")
+        # 发布页项目目录的占位提示动态跟随打包页项目（留空时生效）
+        if hasattr(self, "ent_pub_project"):
+            self.ent_pub_project.set_placeholder(
+                f"留空默认使用打包页的项目目录（当前: {d}）")
+
+    def _pick_output(self):
+        """需求 42: 选择打包产物输出目录。"""
+        d = filedialog.askdirectory(
+            title="选择输出目录",
+            initialdir=self.ent_output.real_value().strip() or str(self.last_dir))
+        if d:
+            self.var_output.set(str(Path(d)))
+
+    def _open_folder_from(self, entry, label: str):
+        """需求 43: 打开输入框对应路径的文件夹（项目目录/输出目录）。"""
+        raw = entry.real_value().strip()
+        if not raw:
+            messagebox.showinfo("提示", f"请先填写{label}")
+            return
+        d = Path(raw).expanduser()
+        if not d.is_dir():
+            messagebox.showinfo("提示", f"目录不存在:\n{d}")
+            return
+        self._open_dir(d)
 
     def _start_build(self):
         if self.busy:
             messagebox.showinfo("提示", "打包正在进行中，请等待完成")
             return
-        project = Path(self.var_project.get().strip())
+        # 需求 43: 用 real_value() 取值，placeholder 显示时视为空串
+        project = Path(self.ent_project.real_value().strip())
         if not project.is_dir():
             messagebox.showerror("错误", "请选择有效的项目目录")
             return
@@ -418,20 +659,22 @@ class PythubGUI:
         logger = get_logger()
         spec = BuildSpec(
             project_dir=project.resolve(),
-            name=self.var_name.get().strip() or "app",
-            entry=self.var_entry.get().strip() or "main.py",
+            name=self.ent_name.real_value().strip() or "app",
+            entry=self.ent_entry.real_value().strip() or "main.py",
             requirements=reqs,
             platform=plat,
             arch=self.var_arch.get(),
             python=self.var_py.get(),
             fmt=fmt,
-            output=project.resolve() / "dist",
+            output=Path(self.ent_output.real_value().strip() or project.resolve() / "dist"),  # 需求 42/43: 自定义输出目录，placeholder 视为空
             engine=self.var_engine.get(),
             windowed=self.var_windowed.get(),
             mem=self.var_mem.get(),
             sign=self.var_sign.get(),
             chmod=self.var_chmod.get(),
             app_wrap=self.var_app_wrap.get(),
+            rpm_engine=self.var_rpm_engine.get(),
+            bundle_id=self.var_bundle_id.get().strip(),
         )
 
         attach_queue_handler(self.q)
@@ -479,24 +722,56 @@ class PythubGUI:
 
         # 需求 19: 启动时从 settings.json 恢复上次保存的发布配置
         saved = load_settings().get("publish", {})
+        # 兼容旧配置: 单一 files 字段按扩展名拆分到 sdist/wheel 两个输入框
+        saved_sdist = saved.get("sdist", "")
+        saved_whl = saved.get("whl", "")
+        if not saved_sdist and not saved_whl and saved.get("files"):
+            for part in str(saved["files"]).split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                if part.endswith(".whl"):
+                    saved_whl = saved_whl or part
+                else:
+                    saved_sdist = saved_sdist or part
 
-        ttk.Label(frm, text="发行文件:").grid(row=0, column=0, sticky="e", padx=4, pady=4)
-        self.var_files = tk.StringVar(value=saved.get("files", ""))
-        ttk.Entry(frm, textvariable=self.var_files).grid(row=0, column=1, sticky="we", padx=4)
-        ttk.Button(frm, text="浏览...", command=self._pick_dist).grid(row=0, column=2, padx=4)
+        # 需求 48: 发布页项目目录（留空默认跟随打包页，手动输入的优先）
+        ttk.Label(frm, text="项目目录:").grid(row=0, column=0, sticky="e", padx=4, pady=4)
+        self.var_pub_project = tk.StringVar(value="")
+        self.ent_pub_project = _PlaceholderEntry(
+            frm, "留空默认使用打包页的项目目录（手动输入的目录优先）",
+            self.var_pub_project)
+        self.ent_pub_project.grid(row=0, column=1, sticky="we", padx=4)
+        ttk.Button(frm, text="浏览...",
+                   command=self._pick_pub_project).grid(row=0, column=2, padx=4)
 
-        ttk.Label(frm, text="仓库:").grid(row=1, column=0, sticky="e", padx=4, pady=4)
+        # 发行文件拆分 sdist / wheel 两个输入框，构建发行包后自动分类回填
+        ttk.Label(frm, text="sdist:").grid(row=1, column=0, sticky="e", padx=4, pady=4)
+        self.var_file_sdist = tk.StringVar(value=saved_sdist)
+        ttk.Entry(frm, textvariable=self.var_file_sdist).grid(
+            row=1, column=1, sticky="we", padx=4)
+        ttk.Button(frm, text="浏览...",
+                   command=self._pick_pub_sdist).grid(row=1, column=2, padx=4)
+
+        ttk.Label(frm, text="wheel:").grid(row=2, column=0, sticky="e", padx=4, pady=4)
+        self.var_file_whl = tk.StringVar(value=saved_whl)
+        ttk.Entry(frm, textvariable=self.var_file_whl).grid(
+            row=2, column=1, sticky="we", padx=4)
+        ttk.Button(frm, text="浏览...",
+                   command=self._pick_pub_whl).grid(row=2, column=2, padx=4)
+
+        ttk.Label(frm, text="仓库:").grid(row=3, column=0, sticky="e", padx=4, pady=4)
         self.var_repo = tk.StringVar(value=saved.get("repo", "pypi"))
         cmb_repo = ttk.Combobox(frm, textvariable=self.var_repo, values=["pypi", "testpypi"],
                                 state="readonly", width=12)
-        cmb_repo.grid(row=1, column=1, sticky="w", padx=4)
+        cmb_repo.grid(row=3, column=1, sticky="w", padx=4)
         cmb_repo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_cred_status())
 
         # 需求 24: 凭据来源开关（系统已配置凭据 vs 手动输入）
         self.var_cred_sys = tk.BooleanVar(value=bool(load_pypi_credentials()))
-        ttk.Label(frm, text="凭据来源:").grid(row=2, column=0, sticky="e", padx=4, pady=4)
+        ttk.Label(frm, text="凭据来源:").grid(row=4, column=0, sticky="e", padx=4, pady=4)
         cred_row = ttk.Frame(frm)
-        cred_row.grid(row=2, column=1, sticky="w", padx=4)
+        cred_row.grid(row=4, column=1, sticky="w", padx=4)
         ttk.Checkbutton(cred_row, text="使用系统已配置的凭据",
                         variable=self.var_cred_sys,
                         command=self._refresh_cred_status).pack(side="left")
@@ -504,24 +779,33 @@ class PythubGUI:
         ttk.Label(cred_row, textvariable=self.var_cred_status,
                   foreground="#777").pack(side="left", padx=8)
 
-        ttk.Label(frm, text="用户名:").grid(row=3, column=0, sticky="e", padx=4, pady=4)
+        ttk.Label(frm, text="用户名:").grid(row=5, column=0, sticky="e", padx=4, pady=4)
         self.var_user = tk.StringVar(value=saved.get("username", "__token__"))
-        ttk.Entry(frm, textvariable=self.var_user).grid(row=3, column=1, sticky="we", padx=4)
+        ttk.Entry(frm, textvariable=self.var_user).grid(row=5, column=1, sticky="we", padx=4)
 
-        ttk.Label(frm, text="密码/Token:").grid(row=4, column=0, sticky="e", padx=4, pady=4)
+        ttk.Label(frm, text="密码/Token:").grid(row=6, column=0, sticky="e", padx=4, pady=4)
         self.var_token = tk.StringVar(value=saved.get("token", ""))
         ttk.Entry(frm, textvariable=self.var_token, show="*").grid(
-            row=4, column=1, sticky="we", padx=4)
+            row=6, column=1, sticky="we", padx=4)
 
         row = ttk.Frame(f)
         row.pack(padx=8, pady=6, anchor="w")
         ttk.Button(row, text="加载系统配置", command=self._load_sys_credentials).pack(side="left")
         ttk.Button(row, text="保存到系统配置", command=self._save_sys_credentials).pack(side="left", padx=6)
         ttk.Button(row, text="保存配置", command=self._save_publish_cfg).pack(side="left")
-        ttk.Button(f, text="发布到 PyPI", command=self._start_publish).pack(padx=8, pady=6, anchor="w")
+        # 需求 48: 「构建发行包」按钮，构建→上传 GUI 闭环
+        act_row = ttk.Frame(f)
+        act_row.pack(padx=8, pady=6, anchor="w")
+        ttk.Button(act_row, text="构建发行包（sdist + wheel）",
+                   command=self._start_build_dist).pack(side="left")
+        self.btn_pub = ttk.Button(act_row, text="发布到 PyPI",
+                                  command=self._start_publish)
+        self.btn_pub.pack(side="left", padx=6)
         self.var_pub_status = tk.StringVar(value="就绪")
         ttk.Label(f, textvariable=self.var_pub_status, foreground="#367bf0").pack(padx=8, anchor="w")
-        ttk.Label(f, text="提示: 先用 `pythub pypa build` 或打包页生成 .whl/.tar.gz，再在此上传。",
+        ttk.Label(f, text="提示: 项目目录留空则跟随打包页的项目目录（手动输入的优先）；"
+                          "「构建发行包」自动按类型回填 sdist / wheel 输入框，"
+                          "「发布到 PyPI」上传两个输入框中的全部有效文件。",
                   foreground="#777").pack(padx=8, anchor="w")
         ttk.Label(f, text="系统凭据来源: 环境变量 TWINE_USERNAME/TWINE_PASSWORD 或 ~/.pypirc；"
                           "「保存到系统配置」写入 ~/.pypirc（权限 600，明文，注意机器安全）；"
@@ -534,7 +818,8 @@ class PythubGUI:
 
         s = load_settings()
         s["publish"] = {
-            "files": self.var_files.get().strip(),
+            "sdist": self.var_file_sdist.get().strip(),
+            "whl": self.var_file_whl.get().strip(),
             "repo": self.var_repo.get(),
             "username": self.var_user.get().strip(),
             "token": self.var_token.get().strip(),
@@ -595,20 +880,106 @@ class PythubGUI:
         self._refresh_cred_status()
         self.var_pub_status.set(f"系统凭据已保存 ✓（{path}）")
 
-    def _pick_dist(self):
-        # macOS Aqua Tk 的 filetypes 遇到多点扩展名（如 *.tar.gz）会在
-        # setAllowedFileTypes 转 UTType 时崩溃（object cannot be nil），
-        # 故 darwin 下用单点 *.gz 匹配 .tar.gz；其余平台通配项用 *
+    def _pick_pub_project(self):
+        """选择发布页项目目录。"""
+        d = filedialog.askdirectory(
+            title="选择项目目录", initialdir=str(self.last_dir))
+        if d:
+            self.last_dir = Path(d)
+            self.var_pub_project.set(d)
+
+    def _pick_pub_sdist(self):
+        """选择 sdist 发行包（.tar.gz/.zip），可多选，逗号分隔。"""
+        # darwin 下多点扩展名（*.tar.gz）会让 Aqua Tk 转 UTType 崩溃，
+        # 故 darwin 用单点 *.gz 匹配
         if sys.platform == "darwin":
-            ftypes = [("发行包", ("*.whl", "*.zip", "*.gz"))]
+            ftypes = [("sdist 包", ("*.gz", "*.zip")), ("全部文件", "*")]
         else:
-            ftypes = [("发行包", ("*.whl", "*.tar.gz", "*.zip")), ("全部文件", "*")]
+            ftypes = [("sdist 包", ("*.tar.gz", "*.zip")), ("全部文件", "*")]
         files = filedialog.askopenfilenames(
-            title="选择发行文件", initialdir=str(self.last_dir),
+            title="选择 sdist 发行包", initialdir=str(self.last_dir),
             filetypes=ftypes)
         if files:
             self.last_dir = Path(files[0]).parent
-            self.var_files.set(", ".join(files))
+            self.var_file_sdist.set(", ".join(files))
+
+    def _pick_pub_whl(self):
+        """选择 wheel 发行包（.whl），可多选，逗号分隔。"""
+        files = filedialog.askopenfilenames(
+            title="选择 wheel 发行包", initialdir=str(self.last_dir),
+            filetypes=[("wheel 包", ("*.whl",)), ("全部文件", "*")])
+        if files:
+            self.last_dir = Path(files[0]).parent
+            self.var_file_whl.set(", ".join(files))
+
+    def _pub_files(self) -> list:
+        """收集 sdist/wheel 两个输入框中的有效发行文件路径（发布用）。"""
+        vals = []
+        for var in (self.var_file_sdist, self.var_file_whl):
+            for part in var.get().split(","):
+                part = part.strip()
+                if part and Path(part).exists():
+                    vals.append(Path(part))
+        return vals
+
+    def _start_build_dist(self):
+        """需求 48: 一键构建发行包（sdist+wheel），构建→上传 GUI 闭环。
+
+        项目目录/输出目录取打包页当前值（输出留空则用 <项目>/dist），
+        后台线程执行，完成后把产物回填到「发行文件」输入框。"""
+        from pythub.pypa import build_package
+        from pythub.utils import get_logger
+
+        if self.busy:
+            messagebox.showinfo("提示", "有任务正在进行中，请等待完成")
+            return
+        # 项目目录: 手动输入优先，留空默认跟随打包页
+        manual_proj = self.ent_pub_project.real_value().strip()
+        build_proj = self.ent_project.real_value().strip()
+        project = Path(manual_proj or build_proj)
+        if not project.is_dir():
+            messagebox.showerror(
+                "错误", "请输入有效的项目目录（留空则使用打包页的项目目录）")
+            return
+        # 输出目录: 与打包页同一项目时沿用其输出目录，否则用 <项目>/dist
+        if manual_proj and manual_proj != build_proj:
+            out_dir = project / "dist"
+        else:
+            out_dir = Path(self.ent_output.real_value().strip()) or project / "dist"
+        logger = get_logger()
+
+        self.busy = True
+        self.var_pub_status.set(f"正在构建发行包（{project.name} -> {out_dir}）...")
+
+        def finish_ok(files):
+            self.busy = False
+            self.var_pub_status.set("构建完成 ✓")
+            sdist = [f for f in files if not f.name.endswith(".whl")]
+            wheels = [f for f in files if f.name.endswith(".whl")]
+            if sdist:
+                self.var_file_sdist.set(", ".join(str(f) for f in sdist))
+            if wheels:
+                self.var_file_whl.set(", ".join(str(f) for f in wheels))
+            messagebox.showinfo(
+                "构建成功",
+                "发行包已生成:\n" + "\n".join(str(f) for f in files)
+                + "\n\n已回填到 sdist / wheel 输入框，可直接点「发布到 PyPI」上传。",
+            )
+
+        def finish_err(err):
+            self.busy = False
+            self.var_pub_status.set("构建失败 ✗")
+            messagebox.showerror("构建发行包失败", str(err))
+
+        def work():
+            try:
+                files = build_package(project, out_dir, logger)
+                self.root.after(0, lambda: finish_ok(files))
+            except Exception as e:  # noqa: BLE001
+                logger.error("构建发行包失败: %s", e)
+                self.root.after(0, lambda err=e: finish_err(err))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _start_publish(self):
         from pythub.pypa import load_pypi_credentials
@@ -616,8 +987,7 @@ class PythubGUI:
         if self.busy:
             messagebox.showinfo("提示", "有任务正在进行中")
             return
-        files = [Path(x.strip()) for x in self.var_files.get().split(",") if x.strip()]
-        files = [f for f in files if f.exists()]
+        files = self._pub_files()
         if not files:
             messagebox.showerror("错误", "请选择有效的发行文件 (.whl/.tar.gz)")
             return
@@ -683,10 +1053,552 @@ class PythubGUI:
         threading.Thread(target=work, daemon=True).start()
 
 
+    # ------------------------------------------------ 工具管理页（需求 37）
+
+    def _build_tab_tools(self):
+        from pythub import SUPPORTED_ARCHS, SUPPORTED_PYTHON
+        from pythub.tools import (
+            COMPILER_CHOICES,
+            ZIG_MANAGED_DIR,
+            default_compiler,
+            default_python,
+            get_tools_logger,
+        )
+
+        # 工具管理专用日志器: 独立落盘 logs/tools-YYYYMMDD.log（需求 37/40）
+        # （不再转发到主窗口日志区 —— 需求 41: 主窗口已无日志区，
+        #   工具日志由「查看工具日志」弹窗展示）
+        self.tools_logger = get_tools_logger()
+
+        f = self.tab_tools
+
+        # ---- 中: 编译器 / Python 运行时 / 打包工具，标签切换（需求 38/39）----
+        sub = ttk.Notebook(f)
+        sub.pack(fill="x", padx=8, pady=(8, 4))
+        tab_cc = ttk.Frame(sub, padding=8)
+        tab_rt = ttk.Frame(sub, padding=8)
+        tab_pm = ttk.Frame(sub, padding=8)
+        sub.add(tab_cc, text="编译器")
+        sub.add(tab_rt, text="Python运行时")
+        sub.add(tab_pm, text="打包工具")
+
+        # 打包工具子页: rpmbuild 托管管理（需求 39）+ 其余工具链状态说明
+        self.lbl_rpm_status = ttk.Label(tab_pm, text="", justify="left")
+        self.lbl_rpm_status.pack(anchor="w")
+        row_rpm = ttk.Frame(tab_pm)
+        row_rpm.pack(anchor="w", pady=4)
+        ttk.Button(row_rpm, text="安装 rpmbuild（经系统包管理器）",
+                   command=self._tools_install_rpmbuild).pack(side="left")
+        ttk.Button(row_rpm, text="卸载 rpmbuild",
+                   command=self._tools_uninstall_rpmbuild).pack(side="left", padx=6)
+        ttk.Label(tab_pm, text="RPM 引擎选 rpmbuild 时依赖此工具；缺失时自动用自研引擎（无需安装）。",
+                  foreground="#777").pack(anchor="w", pady=(0, 8))
+
+        # 编译器子页: 顶部默认编译器设置，下方三个编译器具体管理区块
+        row2 = ttk.Frame(tab_cc)
+        row2.pack(anchor="w")
+        ttk.Label(row2, text="默认编译器:").pack(side="left")
+        self.var_default_cc = tk.StringVar(value=default_compiler())
+        ttk.Combobox(row2, textvariable=self.var_default_cc,
+                     values=list(COMPILER_CHOICES), state="readonly", width=8).pack(
+            side="left", padx=6)
+        ttk.Button(row2, text="应用", command=self._tools_set_default_cc).pack(side="left")
+        ttk.Label(tab_cc, text="auto=自动探测（mingw→zig→cc）；zig/mingw/cc=强制优先该编译器",
+                  foreground="#777").pack(anchor="w")
+
+        # zig 区块（交叉编译 linux/macos pexe）
+        ttk.Separator(tab_cc, orient="horizontal").pack(fill="x", pady=8)
+        self.lbl_zig_status = ttk.Label(tab_cc, text="", justify="left")
+        self.lbl_zig_status.pack(anchor="w")
+        row1 = ttk.Frame(tab_cc)
+        row1.pack(anchor="w", pady=4)
+        ttk.Button(row1, text="安装 zig（下载到 pythub 托管目录）",
+                   command=self._tools_install_zig).pack(side="left")
+        ttk.Button(row1, text="卸载托管 zig",
+                   command=self._tools_uninstall_zig).pack(side="left", padx=6)
+        ttk.Label(tab_cc, text="交叉编译（linux/macos pexe，以及没有 mingw 时的 Windows exe）依赖 zig。",
+                  foreground="#777", wraplength=660, justify="left").pack(
+            anchor="w", pady=(2, 4))
+
+        # mingw-w64 区块（Windows PE 交叉编译）
+        ttk.Separator(tab_cc, orient="horizontal").pack(fill="x", pady=8)
+        self.lbl_mingw_status = ttk.Label(tab_cc, text="", justify="left")
+        self.lbl_mingw_status.pack(anchor="w")
+        row_mingw = ttk.Frame(tab_cc)
+        row_mingw.pack(anchor="w", pady=4)
+        ttk.Button(row_mingw, text="安装 mingw-w64（经系统包管理器）",
+                   command=self._tools_install_mingw).pack(side="left")
+        ttk.Button(row_mingw, text="卸载 mingw-w64",
+                   command=self._tools_uninstall_mingw).pack(side="left", padx=6)
+        ttk.Label(tab_cc, text="Windows PE 优先 mingw-w64 编译引导器；缺失时自动改用 zig cc。",
+                  foreground="#777").pack(anchor="w")
+
+        # cc 区块（系统原生编译器，POSIX 本机编译兜底）
+        ttk.Separator(tab_cc, orient="horizontal").pack(fill="x", pady=8)
+        self.lbl_cc_status = ttk.Label(tab_cc, text="", justify="left")
+        self.lbl_cc_status.pack(anchor="w")
+        row_cc = ttk.Frame(tab_cc)
+        row_cc.pack(anchor="w", pady=4)
+        ttk.Button(row_cc, text="安装 cc（经系统包管理器）",
+                   command=self._tools_install_cc).pack(side="left")
+        ttk.Button(row_cc, text="卸载 cc",
+                   command=self._tools_uninstall_cc).pack(side="left", padx=6)
+        ttk.Label(tab_cc, text="POSIX 本机编译引导器的兜底编译器（clang/gcc）；缺失时自动改用 zig cc。",
+                  foreground="#777").pack(anchor="w")
+
+        # Python 运行时子页
+        self.tree_runtimes = ttk.Treeview(
+            tab_rt, columns=("name", "size"), show="headings", height=8)
+        self.tree_runtimes.heading("name", text="缓存条目")
+        self.tree_runtimes.heading("size", text="大小")
+        self.tree_runtimes.column("name", width=430)
+        self.tree_runtimes.column("size", width=90, anchor="e")
+        self.tree_runtimes.pack(fill="x")
+        row3 = ttk.Frame(tab_rt)
+        row3.pack(anchor="w", pady=4)
+        ttk.Label(row3, text="下载:").pack(side="left")
+        try:
+            from pythub.runtime import detect_current as _detect
+            cur_plat, cur_arch, _ = _detect()
+        except Exception:  # noqa: BLE001
+            cur_plat, cur_arch = "macos", "x86_64"
+        self.var_rt_platform = tk.StringVar(value=cur_plat)
+        ttk.Combobox(row3, textvariable=self.var_rt_platform,
+                     values=["macos", "linux", "windows"], state="readonly",
+                     width=8).pack(side="left", padx=4)
+        self.var_rt_arch = tk.StringVar(value=cur_arch)
+        ttk.Combobox(row3, textvariable=self.var_rt_arch,
+                     values=list(SUPPORTED_ARCHS), state="readonly", width=9).pack(
+            side="left", padx=4)
+        self.var_rt_dl_py = tk.StringVar(value=default_python())
+        ttk.Combobox(row3, textvariable=self.var_rt_dl_py,
+                     values=list(SUPPORTED_PYTHON), state="readonly", width=7).pack(
+            side="left", padx=4)
+        ttk.Button(row3, text="下载运行时",
+                   command=self._tools_download_runtime).pack(side="left", padx=8)
+        ttk.Button(row3, text="移除选中",
+                   command=self._tools_remove_runtime).pack(side="left")
+        row4 = ttk.Frame(tab_rt)
+        row4.pack(anchor="w")
+        ttk.Label(row4, text="默认 Python 版本:").pack(side="left")
+        self.var_rt_pyver = tk.StringVar(value=default_python())
+        ttk.Combobox(row4, textvariable=self.var_rt_pyver,
+                     values=list(SUPPORTED_PYTHON), state="readonly", width=7).pack(
+            side="left", padx=6)
+        ttk.Button(row4, text="设为默认",
+                   command=self._tools_set_default_python).pack(side="left")
+
+        # 运行时下载源切换（需求: GUI 可配置 runtime.mirror）
+        from pythub.runtime import GITHUB_RELEASE_BASE, NPM_MIRROR_BASE
+        from pythub.utils import load_settings
+        self._rt_auto_label = "自动（GitHub → npmmirror 镜像兜底）"
+        self._rt_source_map = {
+            self._rt_auto_label: "",
+            "GitHub 官方": GITHUB_RELEASE_BASE,
+            "npmmirror 镜像（大陆加速）": NPM_MIRROR_BASE,
+            "自定义...": None,
+        }
+        _cur_mirror = str(load_settings().get("runtime", {}).get("mirror", ""))
+        if _cur_mirror:
+            _cur_src = next(
+                (k for k, v in self._rt_source_map.items() if v == _cur_mirror),
+                "自定义...")
+        else:
+            _cur_src = self._rt_auto_label
+        row_rt_src = ttk.Frame(tab_rt)
+        row_rt_src.pack(anchor="w", pady=(6, 0))
+        ttk.Label(row_rt_src, text="下载源:").pack(side="left")
+        self.var_rt_source = tk.StringVar(value=_cur_src)
+        _src_cb = ttk.Combobox(row_rt_src, textvariable=self.var_rt_source,
+                               values=list(self._rt_source_map),
+                               state="readonly", width=32)
+        _src_cb.pack(side="left", padx=6)
+        # ttk.Combobox 无 command 选项，选择变化走虚拟事件
+        _src_cb.bind("<<ComboboxSelected>>", lambda _e: self._tools_apply_source())
+        ttk.Label(tab_rt,
+                  text="自动: GitHub 失败自动切换 npmmirror 镜像（推荐大陆网络）；"
+                       "「自定义...」可填入自建镜像的 base URL，选择后立即保存到 settings.json。",
+                  foreground="#777", wraplength=660, justify="left").pack(
+            anchor="w", pady=(2, 0))
+        ttk.Label(tab_rt, text="打包页「Python 版本」初始值即取默认版本设置；"
+                               "「设为默认」会持久化到 settings.json。",
+                  foreground="#777").pack(anchor="w")
+
+        # ---- 下: 刷新/日志按钮 + 工具链状态清单（需求 40）----
+        self.var_tools_status = tk.StringVar(value="就绪")
+        row5 = ttk.Frame(f)
+        row5.pack(anchor="w", padx=8, pady=4)
+        ttk.Button(row5, text="刷新工具状态",
+                   command=self._tools_refresh_all).pack(side="left")
+        ttk.Button(row5, text="查看工具日志",
+                   command=self._tools_show_log).pack(side="left", padx=6)
+        ttk.Label(row5, textvariable=self.var_tools_status,
+                  foreground="#367bf0").pack(side="left", padx=8)
+        frm4 = ttk.LabelFrame(f, text="工具链状态清单", padding=8)
+        frm4.pack(fill="x", padx=8, pady=4)
+        self.lbl_pkg_tools = ttk.Label(frm4, text="", justify="left")
+        self.lbl_pkg_tools.pack(anchor="w")
+        ttk.Label(f, text=f"以上所有操作（下载/安装/卸载/移除/设默认）均写入独立日志文件: "
+                          f"logs/tools-YYYYMMDD.log（托管 zig 目录: {ZIG_MANAGED_DIR}）",
+                  foreground="#777", wraplength=680, justify="left").pack(
+            anchor="w", padx=8, pady=(0, 8))
+        self._tools_refresh_all()
+
+    def _tools_show_log(self):
+        """工具管理日志独立弹窗（需求 40/41）: 文件内容自动刷新。"""
+        from pythub.tools import tools_log_file_path
+        from pythub.utils import LOG_DIR
+
+        path = tools_log_file_path()
+        if self._tools_log_win is not None and self._tools_log_win.win.winfo_exists():
+            self._tools_log_win.win.lift()
+            self._tools_log_win.win.focus_set()
+            return
+
+        w = _LogWindow(self.root, f"工具管理日志 — {path.name}",
+                       f"日志文件: {path}（自动刷新）", file_path=path)
+        ttk.Button(w.bar, text="刷新", command=w.reload).pack(side="left", padx=8)
+        ttk.Button(w.bar, text="打开日志目录",
+                   command=lambda: self._open_dir(LOG_DIR)).pack(side="left")
+        self._tools_log_win = w
+
+    def _show_build_log(self):
+        """打包日志独立弹窗（需求 41）: 打开时回放缓冲区，之后实时增量显示。"""
+        if self._build_log_win is not None and self._build_log_win.win.winfo_exists():
+            self._build_log_win.win.lift()
+            self._build_log_win.win.focus_set()
+            return
+        w = _LogWindow(self.root, "打包日志", "打包 / 发布过程日志（实时自动刷新）")
+        w.append_lines(list(self._log_buffer))
+        self._build_log_win = w
+
+    # ---- 工具管理: 状态刷新 ----
+
+    def _tools_refresh_all(self):
+        from pythub.tools import cc_status, mingw_status, packaging_tools_status, rpmbuild_status, zig_status
+
+        # 编译器子页: cc 状态行
+        c = cc_status()
+        if c["found"]:
+            self.lbl_cc_status.config(
+                text=f"cc（系统原生编译器）: ✓ 已安装  版本: {(c['version'] or '未知').splitlines()[0]}\n"
+                     f"      路径: {c['paths'][0]}")
+        else:
+            manage = "可一键安装" if c["can_manage"] else \
+                "（本机未找到 brew/apt/dnf/yum，请手动安装）"
+            self.lbl_cc_status.config(
+                text=f"cc（系统原生编译器）: ✗ 未安装（{manage}）")
+
+        # 编译器子页: mingw 状态行
+        m = mingw_status()
+        if m["found"]:
+            self.lbl_mingw_status.config(
+                text=f"mingw-w64: ✓ 已安装  版本: {m['version'] or '未知'}\n"
+                     f"      路径: {m['paths'][0]}")
+        else:
+            manage = "可一键安装" if m["can_manage"] else \
+                "（本机未找到 brew/apt/dnf/yum，请手动安装）"
+            self.lbl_mingw_status.config(
+                text=f"mingw-w64: ✗ 未安装（{manage}）")
+
+        # rpmbuild 专属状态行（需求 39）
+        rpm = rpmbuild_status()
+        if rpm["found"]:
+            self.lbl_rpm_status.config(
+                text=f"rpmbuild: ✓ 已安装 — {rpm['path']}")
+        else:
+            manage = "可一键安装" if rpm["can_manage"] else "（本机未找到 brew/apt/dnf/yum/zypper，请手动安装）"
+            self.lbl_rpm_status.config(
+                text=f"rpmbuild: ✗ 未安装（{manage}）")
+
+        z = zig_status()
+        if z["found"]:
+            tag = "pythub 托管" if z["managed"] else "系统安装"
+            self.lbl_zig_status.config(
+                text=f"zig: ✓ 已安装（{tag}）  版本: {z['version']}\n"
+                     f"      路径: {z['path']}")
+        else:
+            self.lbl_zig_status.config(
+                text="zig: ✗ 未安装（交叉编译 linux/macos pexe 及无 mingw 时的 Windows exe 需要）")
+
+        lines = []
+        for t in packaging_tools_status():
+            if t["found"]:
+                lines.append(f"[✓] {t['label']} — {t['path']}")
+            else:
+                lines.append(f"[✗] {t['label']} — 未安装（{t['hint']}）")
+        self.lbl_pkg_tools.config(text="\n".join(lines))
+
+        # 运行时缓存列表（iid = 缓存目录路径，供移除使用）
+        from pythub.tools import list_runtimes
+        self.tree_runtimes.delete(*self.tree_runtimes.get_children())
+        for it in list_runtimes():
+            self.tree_runtimes.insert(
+                "", "end", iid=str(it["path"]),
+                values=(it["name"], self._fmt_size(it["size"])))
+
+    # ---- 工具管理: 后台任务 ----
+
+    def _tools_task(self, status_text: str, fn, ok_msg: str = "完成 ✓"):
+        """耗时工具操作跑后台线程（界面不卡顿），结束/失败后刷新状态。"""
+        if self.busy:
+            messagebox.showinfo("提示", "有任务正在进行中")
+            return
+        self.busy = True
+        self.var_tools_status.set(status_text)
+        logger = self.tools_logger
+
+        def done_ok(result):
+            self.busy = False
+            self.var_tools_status.set(ok_msg)
+            self._tools_refresh_all()
+            if result:
+                messagebox.showinfo("完成", str(result))
+
+        def done_err(err):
+            self.busy = False
+            self.var_tools_status.set("操作失败 ✗")
+            messagebox.showerror("工具管理", str(err))
+
+        def work():
+            try:
+                result = fn()
+                self.root.after(0, lambda: done_ok(result))
+            except Exception as e:  # noqa: BLE001
+                logger.error("工具管理操作失败: %s", e)
+                self.root.after(0, lambda err=e: done_err(err))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---- 工具管理: 具体操作 ----
+
+    def _tools_install_zig(self):
+        from pythub.tools import ZIG_MANAGED_DIR
+
+        if not messagebox.askyesno(
+                "安装 zig",
+                f"将下载最新稳定版 zig 并安装到 pythub 托管目录:\n{ZIG_MANAGED_DIR}\n\n"
+                "安装后构建时自动识别，无需配置 PATH。继续？"):
+            return
+        from pythub.tools import install_zig
+
+        def _do():
+            binary = install_zig(logger=self.tools_logger)
+            return (f"zig 已下载并安装完成 ✓\n"
+                    f"安装路径: {binary}\n"
+                    "构建时自动识别（PYTHUB_ZIG > 托管目录 > PATH），无需配置 PATH")
+
+        self._tools_task(
+            "正在下载/安装 zig ...", _do,
+            ok_msg="zig 已下载并安装完成 ✓")
+
+    def _tools_uninstall_zig(self):
+        from pythub.tools import uninstall_zig
+
+        if not messagebox.askyesno(
+                "卸载 zig",
+                "仅卸载 pythub 托管安装的 zig（系统其他位置安装的不受影响）。继续？"):
+            return
+
+        def _do():
+            uninstall_zig(logger=self.tools_logger)
+            return "pythub 托管 zig 已卸载 ✓\n（如需重新安装，随时点「安装 zig」即可）"
+
+        self._tools_task(
+            "正在卸载托管 zig ...", _do,
+            ok_msg="托管 zig 已卸载 ✓")
+
+    def _tools_set_default_cc(self):
+        from pythub.tools import set_default_compiler
+
+        set_default_compiler(self.var_default_cc.get(), logger=self.tools_logger)
+        self.var_tools_status.set(f"默认编译器已设为 {self.var_default_cc.get()} ✓")
+
+    def _tools_download_runtime(self):
+        from pythub.tools import download_runtime
+
+        plat, arch, pyver = (
+            self.var_rt_platform.get(), self.var_rt_arch.get(), self.var_rt_dl_py.get())
+
+        def _do():
+            path = download_runtime(plat, arch, pyver, logger=self.tools_logger)
+            return (f"Python 运行时下载完成 ✓\n"
+                    f"版本: Python {pyver} ({plat}/{arch})\n"
+                    f"缓存路径: {path}")
+
+        self._tools_task(
+            f"正在下载运行时 Python {pyver} ({plat}/{arch}) ...", _do,
+            ok_msg=f"运行时 Python {pyver} ({plat}/{arch}) 就绪 ✓")
+
+    def _tools_remove_runtime(self):
+        from pythub.tools import remove_runtime
+
+        sel = self.tree_runtimes.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先在列表中选中要移除的运行时缓存")
+            return
+        path = Path(sel[0])
+        if not messagebox.askyesno(
+                "确认移除", f"移除运行时缓存:\n{path}\n\n下次打包用到时会自动重新下载。"):
+            return
+
+        def _do():
+            remove_runtime(path, logger=self.tools_logger)
+            return f"运行时缓存已移除 ✓\n{path.name}\n下次打包用到时会自动重新下载"
+
+        self._tools_task(
+            f"正在移除 {path.name} ...", _do,
+            ok_msg="运行时缓存已移除 ✓")
+
+    def _tools_set_default_python(self):
+        from pythub.tools import set_default_python
+
+        set_default_python(self.var_rt_pyver.get(), logger=self.tools_logger)
+        self.var_rt_dl_py.set(self.var_rt_pyver.get())
+        self.var_tools_status.set(f"默认 Python 版本已设为 {self.var_rt_pyver.get()} ✓")
+
+    def _tools_apply_source(self):
+        """应用运行时下载源选择（立即持久化到 settings.json runtime.mirror）。"""
+        from pythub.runtime import runtime_sources
+        from pythub.utils import load_settings, save_settings
+
+        label = self.var_rt_source.get()
+        if label == "自定义...":
+            import tkinter.simpledialog as simpledialog
+
+            url = simpledialog.askstring(
+                "自定义下载源",
+                "输入镜像 base URL（目录形式，如 https://registry.npmmirror.com"
+                "/-/binary/python-build-standalone）。\n留空恢复自动模式:",
+                initialvalue=load_settings().get("runtime", {}).get("mirror", ""),
+                parent=self.root)
+            if url is None:
+                return  # 取消
+            mirror = url.strip().rstrip("/")
+            if not mirror:
+                self.var_rt_source.set(self._rt_auto_label)
+                mirror = ""
+        else:
+            mirror = self._rt_source_map.get(label, "")
+
+        settings = load_settings()
+        settings.setdefault("runtime", {})["mirror"] = mirror
+        save_settings(settings)
+        self.tools_logger.info("运行时下载源已切换: %s", label)
+        self.var_tools_status.set(
+            f"运行时下载源: {label}（生效: {', '.join(runtime_sources())}）")
+
+    def _tools_install_rpmbuild(self):
+        from pythub.tools import install_rpmbuild
+
+        if not messagebox.askyesno(
+                "安装 rpmbuild",
+                "将通过系统包管理器安装 rpmbuild:\n"
+                "  macOS: brew install rpm（免 sudo）\n"
+                "  Linux: sudo apt/dnf/yum/zypper（需要输入 sudo 密码，"
+                "若当前无法交互输入密码请改在终端手动执行）\n\n继续？"):
+            return
+
+        def _do():
+            return install_rpmbuild(logger=self.tools_logger)
+
+        self._tools_task(
+            "正在安装 rpmbuild ...", _do,
+            ok_msg="rpmbuild 安装完成 ✓")
+
+    def _tools_uninstall_rpmbuild(self):
+        from pythub.tools import uninstall_rpmbuild
+
+        if not messagebox.askyesno(
+                "卸载 rpmbuild",
+                "将通过系统包管理器卸载 rpmbuild。\n"
+                "（缺失时 rpm 格式仍可自动改用自研引擎，不影响打包）\n\n继续？"):
+            return
+
+        def _do():
+            return uninstall_rpmbuild(logger=self.tools_logger)
+
+        self._tools_task(
+            "正在卸载 rpmbuild ...", _do,
+            ok_msg="rpmbuild 已卸载 ✓")
+
+    def _tools_install_mingw(self):
+        from pythub.tools import install_mingw
+
+        if not messagebox.askyesno(
+                "安装 mingw-w64",
+                "将通过系统包管理器安装 mingw-w64:\n"
+                "  macOS: brew install mingw-w64（免 sudo）\n"
+                "  Linux: sudo apt/dnf/yum（需要输入 sudo 密码，"
+                "若当前无法交互输入密码请改在终端手动执行）\n\n继续？"):
+            return
+
+        def _do():
+            return install_mingw(logger=self.tools_logger)
+
+        self._tools_task(
+            "正在安装 mingw-w64 ...", _do,
+            ok_msg="mingw-w64 安装完成 ✓")
+
+    def _tools_uninstall_mingw(self):
+        from pythub.tools import uninstall_mingw
+
+        if not messagebox.askyesno(
+                "卸载 mingw-w64",
+                "将通过系统包管理器卸载 mingw-w64。\n"
+                "（缺失时 Windows PE 交叉编译将自动改用 zig cc）\n\n继续？"):
+            return
+
+        def _do():
+            return uninstall_mingw(logger=self.tools_logger)
+
+        self._tools_task(
+            "正在卸载 mingw-w64 ...", _do,
+            ok_msg="mingw-w64 已卸载 ✓")
+
+    def _tools_install_cc(self):
+        from pythub.tools import install_cc
+
+        if not messagebox.askyesno(
+                "安装 cc",
+                "将通过系统包管理器安装本机 C 编译器:\n"
+                "  macOS: brew install gcc（免 sudo）\n"
+                "  Linux: sudo apt/dnf/yum（需要输入 sudo 密码，"
+                "若当前无法交互输入密码请改在终端手动执行）\n\n继续？"):
+            return
+
+        def _do():
+            return install_cc(logger=self.tools_logger)
+
+        self._tools_task(
+            "正在安装 cc ...", _do,
+            ok_msg="cc 已安装 ✓")
+
+    def _tools_uninstall_cc(self):
+        from pythub.tools import uninstall_cc
+
+        if not messagebox.askyesno(
+                "卸载 cc",
+                "将通过系统包管理器卸载本机 C 编译器。\n"
+                "（缺失时 POSIX 本机编译将自动改用 zig / mingw）\n\n继续？"):
+            return
+
+        def _do():
+            return uninstall_cc(logger=self.tools_logger)
+
+        self._tools_task(
+            "正在卸载 cc ...", _do,
+            ok_msg="cc 已卸载 ✓")
+
     # ------------------------------------------------ 设置页
 
     def _build_tab_settings(self):
-        from pythub.utils import LOG_DIR, load_settings, set_file_logging
+        from pythub.utils import (
+            LOG_DIR,
+            cache_max_bytes,
+            load_settings,
+            set_file_logging,
+        )
 
         f = self.tab_settings
         frm = ttk.Frame(f)
@@ -732,7 +1644,43 @@ class PythubGUI:
                    command=lambda: self._open_dir(PYTHUB_CACHE_DIR)).pack(side="left", padx=6)
         ttk.Button(btnrow, text="按上限清理（LRU）", command=self._prune_cache).pack(
             side="left", padx=6)
+
+        # 缓存大小上限（需求 47）: settings.json cache.max_mb，默认 4096 MB
+        row_cap = ttk.Frame(frm2)
+        row_cap.pack(anchor="w", pady=(6, 0))
+        ttk.Label(row_cap, text="缓存大小上限 (MB):").pack(side="left")
+        self.var_cache_cap = tk.StringVar(value=str(cache_max_bytes() >> 20))
+        ttk.Spinbox(row_cap, from_=64, to=1048576, increment=256,
+                    textvariable=self.var_cache_cap, width=8).pack(
+            side="left", padx=6)
+        ttk.Button(row_cap, text="保存上限",
+                   command=self._save_cache_cap).pack(side="left")
+        ttk.Label(frm2, text="「按上限清理」与引导器运行缓存驱逐均按此上限执行（LRU）；"
+                             "默认 4096 MB = 4GB，保存后持久化到 settings.json。",
+                  foreground="#777", wraplength=680, justify="left").pack(
+            anchor="w", pady=(2, 0))
         self._refresh_cache_stats()
+
+    def _save_cache_cap(self):
+        from pythub.utils import cache_max_bytes, set_cache_max_mb
+
+        raw = self.var_cache_cap.get().strip()
+        try:
+            mb = int(raw)
+        except ValueError:
+            messagebox.showerror("缓存上限", f"请输入正整数（MB），当前输入: {raw!r}")
+            return
+        if mb <= 0:
+            messagebox.showerror("缓存上限", "缓存上限必须为正整数（MB）")
+            return
+        try:
+            set_cache_max_mb(mb)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("缓存上限", f"保存失败: {e}")
+            return
+        self.var_cache_cap.set(str(cache_max_bytes() >> 20))
+        messagebox.showinfo("缓存上限", f"缓存大小上限已保存为 {mb} MB ✓\n"
+                                        "（立即对「按上限清理」生效）")
 
     @staticmethod
     def _fmt_size(n: float) -> str:
@@ -743,24 +1691,29 @@ class PythubGUI:
         return f"{n:.1f} PB"
 
     def _refresh_cache_stats(self):
-        from pythub.utils import PYTHUB_CACHE_DIR, cache_stats
+        from pythub.utils import PYTHUB_CACHE_DIR, cache_max_bytes, cache_stats
 
         stats = cache_stats()
+        cap = cache_max_bytes()
         lines = [f"缓存目录: {PYTHUB_CACHE_DIR}"]
         lines += [f"  {sub}: {self._fmt_size(size)}" for sub, size in stats.items()]
-        lines.append(f"  合计: {self._fmt_size(sum(stats.values()))}")
+        total = sum(stats.values())
+        lines.append(f"  合计: {self._fmt_size(total)} / 上限 {self._fmt_size(cap)}")
         self.lbl_cache_stats.config(text="\n".join(lines))
 
     def _prune_cache(self):
-        from pythub.utils import prune_cache
+        from pythub.utils import cache_max_bytes, prune_cache
 
+        cap_mb = cache_max_bytes() >> 20
+        cap = (f"{cap_mb} MB" if cap_mb < 1024
+               else f"{cap_mb / 1024:.1f} GB")
         if not messagebox.askyesno(
                 "确认清理",
-                "按 LRU 把构建缓存裁剪到默认上限（4GB）？\n"
+                f"按 LRU 把构建缓存裁剪到上限（{cap}）？\n"
                 "最久未使用的解释器/依赖缓存会被删除（下次打包自动重新下载）。\n"
                 "日志与设置不受影响。"):
             return
-        pruned = prune_cache(None)
+        pruned = prune_cache(cache_max_bytes())
         self._refresh_cache_stats()
         if pruned:
             messagebox.showinfo(

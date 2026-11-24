@@ -24,6 +24,8 @@ from pythub.utils import (
 
 RELEASE_TAG = "20241016"
 
+# 旧版静态映射（与 RELEASE_TAG=20241016 对应，保留以保证已有缓存目录兼容）；
+# 3.13 起经上游 latest release 动态解析（见 resolve_runtime）
 PYTHON_PATCH_VERSIONS = {
     "3.10": "3.10.15",
     "3.11": "3.11.10",
@@ -69,14 +71,184 @@ def current_platform() -> str:
 
 
 def patch_version(pyver: str) -> str:
-    if pyver not in PYTHON_PATCH_VERSIONS:
+    if pyver not in SUPPORTED_PYTHON:
         raise ValueError(f"不支持的 Python 版本: {pyver}（可用: {', '.join(SUPPORTED_PYTHON)}）")
-    return PYTHON_PATCH_VERSIONS[pyver]
+    if pyver in PYTHON_PATCH_VERSIONS:
+        return PYTHON_PATCH_VERSIONS[pyver]
+    return resolve_runtime(pyver)[1]
+
+
+# ---------------------------------------------------------------- 上游发布索引动态解析
+
+# 上游 latest release 索引缓存（tag + 各 minor 最新补丁号），落盘后 24h 内复用；
+# 网络不可用时回退到过期缓存，两者皆无才报错
+_INDEX_CACHE = PYTHUB_CACHE_DIR / "runtime-index.json"
+_INDEX_TTL = 24 * 3600
+
+
+def _fetch_release_index() -> dict:
+    """解析上游发布索引（各 minor 最新补丁号 + release tag）。
+
+    GitHub API 优先，npmmirror 镜像兜底（大陆网络 GitHub API 常不可达）。
+    返回 {"fetched": ts, "tag": ..., "patches": {"3.13": "3.13.x", ...}}。"""
+    import json
+    import time
+
+    last_err: Optional[Exception] = None
+    for fetcher in (_fetch_release_index_github, _fetch_release_index_npm):
+        try:
+            data = fetcher()
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            continue
+        _INDEX_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _INDEX_CACHE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        tmp.replace(_INDEX_CACHE)
+        return data
+    raise RuntimeError(
+        "无法获取 python-build-standalone 发布索引\n"
+        f"  GitHub API: {last_err}\n"
+        "请检查网络后重试。") from last_err
+
+
+GITHUB_RELEASE_BASE = (
+    "https://github.com/astral-sh/python-build-standalone/releases/download"
+)
+# npmmirror（淘宝镜像）全量同步 python-build-standalone releases，
+# URL 规律: {base}/{tag}/{文件名}，大陆网络下载速度快
+NPM_MIRROR_BASE = "https://registry.npmmirror.com/-/binary/python-build-standalone"
+
+
+def runtime_sources() -> list:
+    """运行时下载源 base URL 列表（按顺序尝试）。
+
+    显式配置（仅这一个源）: 环境变量 PYTHUB_PYTHON_MIRROR 或 settings.json
+    的 runtime.mirror，值为目录形式的 base URL（如 npmmirror 镜像地址）。
+    未配置时: GitHub 官方优先、npmmirror 镜像兜底。"""
+    from pythub.utils import load_settings
+
+    explicit = os.environ.get("PYTHUB_PYTHON_MIRROR") \
+        or load_settings().get("runtime", {}).get("mirror")
+    if explicit:
+        return [str(explicit).rstrip("/")]
+    return [GITHUB_RELEASE_BASE, NPM_MIRROR_BASE]
+
+
+def _http_get_text(url: str, timeout: int = 30) -> str:
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={"User-Agent": "pythub/0.1"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def _http_get_json(url: str, timeout: int = 30):
+    import json
+
+    return json.loads(_http_get_text(url, timeout=timeout))
+
+
+def _parse_cpython_full(name: str) -> Optional[Tuple[str, str]]:
+    """从产物文件名 cpython-3.13.18+... 解析 (minor 版本, 完整补丁版本)。"""
+    import re
+
+    m = re.match(r"^cpython-(\d+)\.(\d+)\.(\d+)\+", name)
+    if not m:
+        return None
+    return (
+        f"{m.group(1)}.{m.group(2)}",
+        f"{m.group(1)}.{m.group(2)}.{m.group(3)}",
+    )
+
+
+def _merge_patch(patches: dict, key: str, full: str) -> None:
+    cur = patches.get(key)
+    if cur is None or tuple(full.split(".")) > tuple(cur.split(".")):
+        patches[key] = full
+
+
+def _fetch_release_index_github() -> dict:
+    import time
+
+    release = _http_get_json(
+        "https://api.github.com/repos/astral-sh/"
+        "python-build-standalone/releases/latest")
+    patches: dict = {}
+    for asset in release.get("assets") or []:
+        parsed = _parse_cpython_full(str(asset.get("name", "")))
+        if parsed:
+            _merge_patch(patches, *parsed)
+    return {"fetched": time.time(),
+            "tag": release.get("tag_name") or "", "patches": patches}
+
+
+def _fetch_release_index_npm() -> dict:
+    """npmmirror 镜像兜底: 列 tag 目录取最新，再列文件解析补丁号。"""
+    import time
+
+    listing = _http_get_json(f"{NPM_MIRROR_BASE}/")
+    tags = [
+        e for e in listing
+        if str(e.get("name", "")).rstrip("/").isdigit()
+    ]
+    if not tags:
+        raise RuntimeError("镜像 tag 目录为空")
+    tag = max(tags, key=lambda e: str(e.get("date", "")))["name"].rstrip("/")
+    patches: dict = {}
+    for entry in _http_get_json(f"{NPM_MIRROR_BASE}/{tag}/"):
+        parsed = _parse_cpython_full(str(entry.get("name", "")))
+        if parsed:
+            _merge_patch(patches, *parsed)
+    return {"fetched": time.time(), "tag": tag, "patches": patches}
+
+
+def _release_index(logger: Optional[logging.Logger] = None) -> dict:
+    import json
+    import time
+
+    cached: Optional[dict] = None
+    try:
+        cached = json.loads(_INDEX_CACHE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    if cached and cached.get("fetched", 0) + _INDEX_TTL > time.time():
+        return cached
+    try:
+        return _fetch_release_index()
+    except Exception as e:  # noqa: BLE001
+        if cached:
+            if logger:
+                logger.warning("发布索引刷新失败，回退本地缓存: %s", e)
+            return cached
+        raise RuntimeError(
+            "无法获取 python-build-standalone 发布索引"
+            "（网络不可用或 GitHub API 限流）: "
+            f"{e}\n请检查网络后重试。") from e
+
+
+def resolve_runtime(pyver: str) -> Tuple[str, str]:
+    """解析 (release_tag, 完整补丁版本号)。
+
+    3.10~3.12 走静态表（旧 release，保持既有缓存兼容）；其余版本经上游
+    latest release 动态解析。"""
+    if pyver in PYTHON_PATCH_VERSIONS:
+        return RELEASE_TAG, PYTHON_PATCH_VERSIONS[pyver]
+    idx = _release_index()
+    full = idx.get("patches", {}).get(pyver)
+    if not full:
+        avail = ", ".join(
+            sorted(idx.get("patches", {}),
+                   key=lambda v: tuple(int(x) for x in v.split("."))))
+        raise ValueError(
+            f"上游 python-build-standalone（{idx.get('tag', '?')}）未提供 "
+            f"Python {pyver} 的构建。可用版本: {avail or '未知'}")
+    return idx["tag"], full
 
 
 def runtime_dir(platform: str, arch: str, pyver: str) -> Path:
-    full = patch_version(pyver)
-    return PYTHUB_CACHE_DIR / "runtimes" / f"cpython-{full}-{RELEASE_TAG}-{platform}-{arch}"
+    tag, full = resolve_runtime(pyver)
+    return PYTHUB_CACHE_DIR / "runtimes" / f"cpython-{full}-{tag}-{platform}-{arch}"
 
 
 def fetch_runtime(
@@ -93,8 +265,8 @@ def fetch_runtime(
     triplet = TRIPLETS.get((platform, arch))
     if not triplet:
         raise ValueError(f"不支持的 目标平台/架构: {platform}/{arch}")
-    full = patch_version(pyver)
-    cache = runtime_dir(platform, arch, pyver)
+    tag, full = resolve_runtime(pyver)
+    cache = PYTHUB_CACHE_DIR / "runtimes" / f"cpython-{full}-{tag}-{platform}-{arch}"
 
     if (cache / ".pythub-ok").exists():
         # 旧版缓存未瘦身则就地瘦身
@@ -108,29 +280,64 @@ def fetch_runtime(
             )
         return cache
 
-    # 优先使用官方 stripped 变体（无调试符号，体积显著更小，且跨平台无需本地 strip）
-    archive_name = f"cpython-{full}+{RELEASE_TAG}-{triplet}-install_only_stripped.tar.gz"
-    url = f"https://github.com/indygreg/python-build-standalone/releases/download/{RELEASE_TAG}/{archive_name}"
+    # 下载: stripped 变体优先（无调试符号，体积显著更小），缺失回退 install_only；
+    # 下载源按 runtime_sources() 顺序尝试（GitHub → npmmirror / 自定义镜像），
+    # 全部失败才报错；下载后按上游 .sha256 校验完整性
+    variants = [
+        f"cpython-{full}+{tag}-{triplet}-install_only_stripped.tar.gz",
+        f"cpython-{full}+{tag}-{triplet}-install_only.tar.gz",
+    ]
 
     import tempfile
 
     with tempfile.TemporaryDirectory(prefix="pythub-dl-") as td:
         tmp = Path(td)
-        archive = tmp / archive_name
         if logger:
             logger.info("下载嵌入式 Python %s (%s/%s) ...", pyver, platform, arch)
-        download_file(
-            url,
-            archive,
-            logger=logger,
-            progress=ProgressLogger(logger, f"Python {pyver}") if logger else None,
-        )
+        progress = ProgressLogger(logger, f"Python {pyver}") if logger else None
+        archive: Optional[Path] = None
+        last_err: Optional[Exception] = None
+        for base in runtime_sources():
+            # 正确路径形态: {源 base}/{release tag}/{文件名}
+            src_base = f"{base}/{tag}"
+            hit = False
+            for name in variants:
+                dest = tmp / name
+                try:
+                    # 上游若提供同名 .sha256 则下载后校验（astral 近期 release
+                    # 已不再附带，获取失败静默跳过，不影响下载）
+                    expected: Optional[str] = None
+                    try:
+                        expected = _http_get_text(f"{src_base}/{name}.sha256") \
+                            .split()[0].strip().lower()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    download_file(
+                        f"{src_base}/{name}",
+                        dest,
+                        logger=logger,
+                        progress=progress,
+                        expected_sha256=expected,
+                    )
+                    archive, hit = dest, True
+                    break
+                except Exception as e:  # noqa: BLE001
+                    last_err = e
+                    if logger:
+                        logger.warning("下载源不可用（%s）: %s (%s)", base, name, e)
+            if hit:
+                break
+        if archive is None:
+            raise RuntimeError(
+                f"运行时下载失败，已尝试源: {', '.join(runtime_sources())}\n"
+                f"最后错误: {last_err}") from last_err
+
         if logger:
             logger.info("解压运行时...")
         extract_runtime(archive, tmp / "extract")
         root = tmp / "extract" / "python"
         if not root.exists():
-            raise RuntimeError(f"压缩包结构异常，缺少 python/ 目录: {archive_name}")
+            raise RuntimeError(f"压缩包结构异常，缺少 python/ 目录: {archive.name}")
         cache.parent.mkdir(parents=True, exist_ok=True)
         # 暂存目录（同父目录保证 rename 原子性），瘦身与标记先在暂存完成
         staging = cache.parent / f".{cache.name}.tmp-{os.getpid()}"

@@ -100,6 +100,22 @@ class _MemFinder:
 sys.argv = _argv
 sys.meta_path.insert(0, _MemFinder(_codes))
 
+# Pythub 注入打包/运行信息（需求 63: sys.pythub_packaged / sys.pythub_info）
+sys.pythub_packaged = True
+sys.pythub_info = __PYTHUB_INFO__
+sys.pythub_info["runtime"] = {
+    "python": "%d.%d.%d" % sys.version_info[:3],
+    "python_full": sys.version.split()[0],
+    "implementation": sys.implementation.name,
+    "executable": sys.executable,
+    "exe_dir": os.path.dirname(os.path.abspath(sys.executable)),
+    "app_origin": _argv[0] if _argv else "",
+    "source": "<memory:%s>" % _ENTRY,
+    "source_on_disk": False,
+    "cache_dir": os.environ.get("PYTHUB_CACHE") or os.path.join(
+        os.path.expanduser("~"), ".cache", "pythub"),
+}
+
 # 内存资源数据（非代码文件）: 注册为 __pythub_memdata__ 模块，经 pythub.memres 访问
 if _raw.get("data"):
     import types
@@ -114,11 +130,15 @@ exec(_module[0], _globals)
 '''
 
 
-def boot_runner_source(entry: str) -> str:
-    """生成 mem 内存执行引导器源码（作为 app.boot 条目归档）。"""
+def boot_runner_source(entry: str, info=None) -> str:
+    """生成 mem 内存执行引导器源码（作为 app.boot 条目归档）。
+
+    info: 打包信息字典（需求 63），经占位符内嵌进引导器，
+    运行时挂载到 sys.pythub_packaged / sys.pythub_info。"""
     # 模板含大量 Python 花括号（字典推导等），用占位符替换而非 str.format
     src = (BOOT_RUNNER_PROLOGUE_MEM + BOOT_RUNNER_BODY) \
-        .replace("__PYTHUB_ENTRY__", repr(entry))
+        .replace("__PYTHUB_ENTRY__", repr(entry)) \
+        .replace("__PYTHUB_INFO__", repr(info or {}))
     return src
 
 

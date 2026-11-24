@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crogram-pythub"
-version = "0.1.2"
+version = "0.1.3"
 description = "开源的 Python 应用打包工具：一条命令把 Python 应用打包成免装 Python、可直接运行的产物（跨平台、多 Python 版本、多架构），并支持发布到 PyPI"
 readme = "README.md"
 requires-python = ">=3.10"
