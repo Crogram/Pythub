@@ -20,7 +20,7 @@ from pythub.analyzer import analyze
 from pythub.config import app_config, load_requirements
 from pythub.deps import download_wheels, unpack_wheels
 from pythub import formats
-from pythub.runtime import fetch_runtime, interpreter_path
+from pythub.runtime import fetch_runtime, interpreter_path, prune_runtime
 from pythub.utils import (
     ProgressLogger,
     copy_tree,
@@ -57,6 +57,50 @@ def _tag(spec: "BuildSpec", arch: Optional[str] = None) -> str:
     return f"{spec.name}-{ver}-{spec.python}-{spec.platform}-{arch or spec.arch}"
 
 
+def _notarize_artifact(
+    dest: Path,
+    spec: "BuildSpec",
+    logger: logging.Logger,
+) -> None:
+    """需求 65: macOS 产物公证（notarytool submit + stapler staple）。
+
+    凭据缺失或工具链不可用时告警跳过，不中断构建。
+    """
+    from pythub.signing import notarize_file
+
+    if not (spec.apple_id and spec.apple_password):
+        logger.warning("  公证需要 Apple ID 与应用专用密码，已跳过公证")
+        return
+    try:
+        notarize_file(dest, spec.apple_id, spec.apple_password,
+                      spec.team_id, logger=logger)
+    except RuntimeError as e:
+        logger.warning("  公证跳过: %s", e)
+
+
+def _sign_linux_package(
+    artifacts: list,
+    spec: "BuildSpec",
+    logger: logging.Logger,
+) -> None:
+    """需求 62: deb/rpm 产物 GPG 签名（spec.sign 开启时调用，就地签名）。
+
+    构建机缺 dpkg-sig / rpm 工具或 GPG 环境不可用时告警跳过（不中断构建，
+    与 fmt 格式解耦——用户可能勾选 sign 后一次构建多格式产物）。
+    """
+    from pythub.signing import sign_deb, sign_rpm
+
+    for art in artifacts:
+        p = Path(art)
+        try:
+            if p.suffix == ".deb":
+                sign_deb(p, spec.sign_gpg_key, logger)
+            elif p.suffix == ".rpm":
+                sign_rpm(p, spec.sign_gpg_key, logger)
+        except RuntimeError as e:
+            logger.warning("  %s 签名跳过: %s", p.suffix.lstrip("."), e)
+
+
 def _wrap_mac_app(pexe: Path, spec: "BuildSpec", logger: logging.Logger) -> Path:
     """把构建好的 mac pexe 包裹成最小 .app 壳（Finder 直接识别为应用）。
 
@@ -67,7 +111,7 @@ def _wrap_mac_app(pexe: Path, spec: "BuildSpec", logger: logging.Logger) -> Path
     终端运行或改用 .command 启动器）。
     """
     app = pexe.parent / (
-        f"{_tag(spec)}{'-mem' if spec.mem else '-pexe'}.app"
+        f"{_tag(spec)}{'-mem' if (spec.mem or spec.mem_mode == 'embed') else '-pexe'}.app"
     )
     if app.exists():
         shutil.rmtree(app)
@@ -136,9 +180,33 @@ class BuildSpec:
     mem: bool = False           # mem 内存执行模式（仅 exe/pexe 生效）: 开启后源码以
                                 # 字节码内嵌、全程内存执行不落盘，产物后缀
                                 # .mem.exe / .mem.pexe；关闭则为常规磁盘执行
+    mem_mode: str = ""          # 内存模式选择（需求 64，仅 exe/pexe 生效，优先于 mem）:
+                                # ""/disk=常规解压执行；"mem"=源码进内存（同 mem=True）；
+                                # "embed"=内嵌解释器（bootex 进程内 dlopen libpython，
+                                # 落盘仅 libpython+stdlib.zip 两文件，字节码版本 =
+                                # 构建机 Python；不支持 Windows 目标）；
+                                # "static"=解释器静态链接进入口二进制（PyOxidizer
+                                # 式零落盘；Windows 目标仅本机 MSVC 构建可做，
+                                # 交叉不可行——/GL 构件仅 link.exe 可消费）
     sign: bool = False          # Authenticode 签名（仅 exe 格式生效）
     sign_cert: str = ""         # 签名证书 PEM 路径（空 = 自动自签）
     sign_key: str = ""          # 签名私钥 PEM 路径
+    sign_identity: str = ""     # macOS codesign 签名身份（需求 58: sign=true 且
+                                # 平台 macos 时生效；空 = ad-hoc 临时签名；
+                                # pkg 格式不支持 ad-hoc，空时跳过签名）
+    sign_gpg_key: str = ""      # deb/rpm GPG 签名密钥 ID（需求 62: sign=true 且
+                                # 产物为 deb/rpm 时生效；空 = gpg 默认密钥）
+    sign_pfx: str = ""          # PKCS#12 单文件证书（.p12/.pfx，CA 正式证书常见
+                                # 格式；提供时优先于 sign_cert/sign_key）
+    sign_pfx_pass: str = ""     # .p12/.pfx 导出密码
+    sign_timestamp: str = ""    # RFC3161 时间戳服务地址（建议正式证书填写，
+                                # 否则证书过期后签名失效；空 = 不加时间戳）
+    notarize: bool = False      # macOS 公证（需求 65: notarytool submit +
+                                # stapler staple，Gatekeeper 分发要求）
+    apple_id: str = ""          # 公证用 Apple ID
+    apple_password: str = ""    # 公证用应用专用密码（App 专用密码）
+    team_id: str = ""           # 公证 Team ID（可选，多团队账号必填）
+    entitlements: str = ""      # codesign 权限声明 plist 路径（可选）
     chmod: bool = False         # 自动为 run/pexe/pyz 等可执行产物添加执行权限
                                 # （chmod +x，见 _apply_chmod）
     app_wrap: bool = False      # mac 平台把构建好的 pexe 再次包裹成 .app 壳
@@ -183,6 +251,7 @@ def spec_from_project(
         engine=str(cfg.get("engine") or "pythub").strip().lower(),
         windowed=bool(cfg.get("windowed", False)),
         mem=bool(cfg.get("mem", False)),
+        mem_mode=str(cfg.get("mem_mode") or ""),
         sign=bool(cfg.get("sign", False)),
         sign_cert=str(cfg.get("sign_cert", "")),
         sign_key=str(cfg.get("sign_key", "")),
@@ -216,7 +285,8 @@ def build(spec: BuildSpec, logger: logging.Logger) -> List[Path]:
     if not entry.exists():
         raise FileNotFoundError(f"入口脚本不存在: {entry}")
 
-    if spec.target_fmt in ("exe", "pexe") and spec.mem:
+    if spec.target_fmt in ("exe", "pexe") and (
+            spec.mem or spec.mem_mode in ("mem", "embed", "static")):
         artifacts = _build_mem(spec, entry, logger)
         return _apply_chmod(artifacts, logger) if spec.chmod else artifacts
 
@@ -405,30 +475,86 @@ def _build_mem(spec: BuildSpec, entry: Path, logger: logging.Logger) -> List[Pat
             )
 
         # 3. 运行时（内嵌）+ 编译用解释器
-        logger.info("[3/5] 准备目标运行时（内嵌 + 编译字节码）...")
-        runtime = fetch_runtime(spec.platform, spec.arch, spec.python, logger)
-        # 目标运行时二进制在本机可执行时直接用它编译字节码；否则（跨平台/
-        # 跨架构）改用本机同版本 Python——marshal 字节码跨平台兼容，仅需
-        # CPython 版本一致。Apple Silicon 经 Rosetta 可执行 x86_64 macOS
-        # 运行时，视为可执行。
-        rosetta = (spec.platform == "macos" and host_arch == "aarch64"
-                   and spec.arch == "x86_64")
-        runtime_executable = (host_platform == spec.platform
-                              and (spec.arch == host_arch or rosetta))
-        if runtime_executable:
-            py = interpreter_path(runtime, spec.platform)
-            _check_interpreter(runtime, spec.platform)
-        else:
-            py = _find_host_python(spec.python)
-            if not py:
+        embed = spec.mem_mode == "embed"  # 需求 64: 内嵌解释器模式
+        static_mode = spec.mem_mode == "static"  # 需求 64 第四档: 静态内嵌
+        if static_mode:
+            if (spec.platform == "windows" and host_platform != "windows"):
                 raise RuntimeError(
-                    f"交叉构建 {spec.platform}/{spec.arch} mem 格式需要本机安装 "
-                    f"Python {spec.python}（用于编译字节码，版本必须一致）。"
+                    "Windows static 模式不支持交叉编译: PBS Windows 解释器核心"
+                    "构件（build/core/*.obj）全部为 /GL（MSVC 全程序优化）编译，"
+                    "其 IR 为微软专有格式，仅官方 link.exe 可消费。请在 Windows"
+                    "（需 MSVC Build Tools）上打包 Windows 目标，或改用 mem/"
+                    "磁盘模式（均支持交叉编译）。")
+            logger.info("[3/5] 准备目标运行时（static: PBS full 变体 "
+                        "静态链接构件 + frozen stdlib）...")
+            # full 变体（pgo-full, tar.zst, 仅 GitHub 提供）: install/ 运行时树
+            # + build/lib 第三方静态库 + libpython3.x.a —— 解释器构建期静态
+            # 链接进入口二进制（PyOxidizer 同款思路），运行期零 dlopen
+            runtime = fetch_runtime(spec.platform, spec.arch, spec.python,
+                                    logger, kind="full")
+            install_dir = runtime / "install"
+            _check_interpreter(runtime / "install", spec.platform)
+            # 编译用解释器（payload + stdlib frozen 字节码, 需与目标同版本、
+            # 本机可执行）: 本机平台用 full 缓存自带解释器；跨平台改用本机
+            # 同版本 Python（marshal 字节码跨平台兼容）
+            rosetta = (spec.platform == "macos" and host_arch == "aarch64"
+                       and spec.arch == "x86_64")
+            runtime_executable = (host_platform == spec.platform
+                                  and (spec.arch == host_arch or rosetta))
+            if runtime_executable:
+                py = install_dir / "bin" / f"python{spec.python}"
+                if not py.exists():
+                    py = install_dir / "bin" / "python3"
+            else:
+                py = _find_host_python(spec.python)
+                if not py:
+                    raise RuntimeError(
+                        f"static 交叉构建需要本机安装 Python {spec.python}"
+                        "（编译 frozen 字节码，版本必须一致）。")
+                logger.info(
+                    "  目标运行时不可在本机执行，使用本机 Python %s 编译字节码",
+                    spec.python)
+        elif embed:
+            if spec.platform == "windows":
+                raise RuntimeError(
+                    "embed 内嵌解释器模式暂不支持 Windows 目标"
+                    "（mingw/MSVC 交叉链接矩阵复杂）；请用 mem/磁盘模式。")
+            if host_platform != spec.platform or spec.arch != host_arch:
+                raise RuntimeError(
+                    "embed 内嵌解释器模式使用 python-build-standalone 运行时的 "
+                    "libpython（dlopen 进程内加载），仅支持目标平台 = 构建机平台的"
+                    "本机构建。")
+            logger.info("[3/5] 准备目标运行时（embed: PBS libpython + stdlib）...")
+            # embed 构件全部取自 PBS 运行时: libpython 共享库、stdlib zip、
+            # 编译字节码用解释器（三者版本天然一致，不再依赖构建机 CPython）
+            runtime = fetch_runtime(spec.platform, spec.arch, spec.python, logger)
+            _check_interpreter(runtime, spec.platform)
+            py = interpreter_path(runtime, spec.platform)
+        else:
+            logger.info("[3/5] 准备目标运行时（内嵌 + 编译字节码）...")
+            runtime = fetch_runtime(spec.platform, spec.arch, spec.python, logger)
+            # 目标运行时二进制在本机可执行时直接用它编译字节码；否则（跨平台/
+            # 跨架构）改用本机同版本 Python——marshal 字节码跨平台兼容，仅需
+            # CPython 版本一致。Apple Silicon 经 Rosetta 可执行 x86_64 macOS
+            # 运行时，视为可执行。
+            rosetta = (spec.platform == "macos" and host_arch == "aarch64"
+                       and spec.arch == "x86_64")
+            runtime_executable = (host_platform == spec.platform
+                                  and (spec.arch == host_arch or rosetta))
+            if runtime_executable:
+                py = interpreter_path(runtime, spec.platform)
+                _check_interpreter(runtime, spec.platform)
+            else:
+                py = _find_host_python(spec.python)
+                if not py:
+                    raise RuntimeError(
+                        f"交叉构建 {spec.platform}/{spec.arch} mem 格式需要本机安装 "
+                        f"Python {spec.python}（用于编译字节码，版本必须一致）。"
+                    )
+                logger.info(
+                    "  目标运行时不可在本机执行，使用本机 Python %s 编译字节码"
+                    "（marshal 跨平台兼容）", spec.python,
                 )
-            logger.info(
-                "  目标运行时不可在本机执行，使用本机 Python %s 编译字节码"
-                "（marshal 跨平台兼容）", spec.python,
-            )
 
         # 4. 生成模块清单并编译为单体裸 marshal 载荷
         pkg_prefix = ""
@@ -490,29 +616,113 @@ def _build_mem(spec: BuildSpec, entry: Path, logger: logging.Logger) -> List[Pat
         )
         if proc.returncode != 0:
             raise RuntimeError(
-                f"mem 编译失败（运行时 {spec.python}）: {proc.stderr[-2000:] or proc.stdout[-2000:]}"
+                f"mem 编译失败（解释器 {py}）: {proc.stderr[-2000:] or proc.stdout[-2000:]}"
             )
 
-        # 5. 组装单文件二进制（引导器 + 运行时 + 内存载荷）
-        logger.info("[5/5] 组装单文件二进制（引导器 + 运行时 + 内存载荷）...")
+        # 5. 组装单文件二进制（引导器 + [运行时] + 内存载荷）
+        embed = spec.mem_mode == "embed"
+        if static_mode:
+            logger.info("[5/5] 组装单文件二进制（静态内嵌解释器引导器 + "
+                        "frozen stdlib + 载荷）...")
+        elif embed:
+            logger.info("[5/5] 组装单文件二进制（内嵌解释器引导器 + libpython + stdlib.zip + 载荷）...")
+        else:
+            logger.info("[5/5] 组装单文件二进制（引导器 + 运行时 + 内存载荷）...")
         bundle = work / "bundle"
         bundle.mkdir(parents=True)
-        # 保留符号链接（bin/python3 -> python3.X 等）：归档按链接存储
-        shutil.copytree(runtime, bundle / "runtime", symlinks=True)
+        if not embed and not static_mode:
+            # 保留符号链接（bin/python3 -> python3.X 等）：归档按链接存储。
+            # 缓存全量，打包阶段对副本按需裁剪（不用的不进产物）
+            shutil.copytree(runtime, bundle / "runtime", symlinks=True)
+            prune_runtime(bundle / "runtime", logger)
 
         spec.output.mkdir(parents=True, exist_ok=True)
+        sfx = "static" if static_mode else ("embed" if embed else "mem")
         dest = spec.output / (
-            f"{_tag(spec)}.mem.exe" if spec.platform == "windows"
-            else f"{_tag(spec)}.mem.pexe"
+            f"{_tag(spec)}.{sfx}.exe" if spec.platform == "windows"
+            else f"{_tag(spec)}.{sfx}.pexe"
         )
         if dest.exists():
             dest.unlink()
 
-        logger.info("  mem 模式: 源码字节码内嵌、全程内存执行（不落盘）")
+        if embed:
+            logger.info(
+                "  embed 模式: 解释器以动态库进程内加载（dlopen），"
+                "落盘仅 libpython + stdlib.zip 两个文件（免运行时目录树）")
+        else:
+            logger.info("  mem 模式: 源码字节码内嵌、全程内存执行（不落盘）")
         boot_src = mempack.boot_runner_source(
-            entry_module, info=_appinfo_dict(spec)).encode("utf-8")
+            entry_module, info=_appinfo_dict(spec), embed=embed,
+            static=static_mode).encode("utf-8")
         payload = payload_path.read_bytes()
-        if spec.platform == "windows":
+        if static_mode:
+            from pythub.exe_archive import (ensure_static_bootloader,
+                                            make_static_exe, static_pbs_files)
+
+            include_tk = _project_uses_tkinter(spec)
+            if include_tk and spec.platform == "windows":
+                logger.warning(
+                    "  Windows static 模式暂不支持 tkinter（PBS Windows 变体"
+                    "未提供 tcl/tk 导入库，无法静态链接 _tkinter）；"
+                    "如需 GUI 请用 mem/磁盘模式")
+                include_tk = False
+            elif include_tk:
+                logger.info("  检测到应用引用 tkinter，随产物携带 Tcl/Tk 数据"
+                            "目录（static 模式唯一的落盘项）")
+            libs, frozen_blob, tcltk_bytes, extmods, wdlls = static_pbs_files(
+                runtime, spec.platform, spec.python, logger,
+                include_tk=include_tk, compile_py=Path(py))
+            bootexe = ensure_static_bootloader(
+                spec.platform, spec.arch, spec.python, runtime,
+                console=not spec.windowed, logger=logger)
+            if spec.platform == "windows":
+                logger.info(
+                    "  static 模式: 解释器核心 objs 静态链接进入口二进制"
+                    "（inittab 注册 %d 个扩展模块），stdlib frozen 全内存"
+                    "执行，依赖 DLL 随归档携带（%s）",
+                    len(extmods),
+                    ", ".join(d.name for d in wdlls) or "无")
+            else:
+                logger.info(
+                    "  static 模式: 解释器静态链接进入口二进制（%s），"
+                    "stdlib frozen 全内存执行，除 GUI tcl/tk 数据外零落盘",
+                    libs[0].name)
+            import zipfile as _zipfile
+            wdlls_bytes = b""
+            if wdlls:
+                import io
+                wbuf = io.BytesIO()
+                with _zipfile.ZipFile(wbuf, "w", _zipfile.ZIP_DEFLATED,
+                                      compresslevel=9) as zf:
+                    for dll in wdlls:
+                        zf.write(dll, dll.name)
+                wdlls_bytes = wbuf.getvalue()
+            make_static_exe(dest, bootexe, spec.platform, spec.arch,
+                            spec.python, logger,
+                            console=not spec.windowed,
+                            app_name=spec.name,
+                            mem_boot=boot_src, mem_payload=payload,
+                            embed_stdlzf=frozen_blob,
+                            embed_tcltk=tcltk_bytes,
+                            embed_wdlls=wdlls_bytes)
+        elif embed:
+            from pythub.exe_archive import embed_pbs_files
+
+            include_tk = _project_uses_tkinter(spec)
+            if include_tk:
+                logger.info("  检测到应用引用 tkinter，随产物携带 Tcl/Tk 数据目录")
+            pylib_bytes, _pylib_name, stdlz_bytes, _pyver, tcltk_bytes = \
+                embed_pbs_files(runtime, spec.platform, spec.python, logger,
+                                include_tk=include_tk)
+            formats.make_native_exe(bundle, dest, spec.platform, spec.arch,
+                                    spec.python, logger,
+                                    console=not spec.windowed,
+                                    app_name=spec.name,
+                                    mem_boot=boot_src, mem_payload=payload,
+                                    embed_pylib=pylib_bytes,
+                                    embed_stdlz=stdlz_bytes,
+                                    embed_tcltk=tcltk_bytes)
+        elif spec.platform == "windows":
             formats.make_exe(bundle, dest, spec.arch, spec.python, logger,
                              console=not spec.windowed, app_name=spec.name,
                              mem_boot=boot_src, mem_payload=payload)
@@ -558,7 +768,8 @@ def _appinfo_dict(spec: "BuildSpec") -> dict:
             "platform": spec.platform,
             "arch": spec.arch,
             "python": spec.python,
-            "mem": bool(spec.mem),
+            "mem": bool(spec.mem or spec.mem_mode in ("embed", "static")),
+            "mem_mode": spec.mem_mode or ("mem" if spec.mem else "disk"),
         },
         "build": {
             "python": "%d.%d.%d" % sys.version_info[:3],
@@ -607,7 +818,7 @@ sys.pythub_info["runtime"] = {{
     "implementation": sys.implementation.name,
     "executable": sys.executable,
     "exe_dir": os.path.dirname(os.path.abspath(sys.executable)),
-    "app_origin": sys.argv[0] if sys.argv else "",
+    "app_origin": os.path.abspath(sys.argv[0]) if sys.argv else "",
     "source": os.path.join(_zp, _entry),
     "source_on_disk": True,
     "cache_dir": os.environ.get("PYTHUB_CACHE") or os.path.join(
@@ -699,6 +910,30 @@ def _project_files(project_dir: Path) -> List[Path]:
     return result
 
 
+def _project_uses_tkinter(spec: "BuildSpec") -> bool:
+    """扫描应用源码是否引用 tkinter/_tkinter。
+
+    embed 模式（需求 64）据此决定是否随产物携带 Tcl/Tk 数据目录——PBS 构建
+    的 _tkinter 静态内嵌于 libpython，但 Tcl 数据查找路径指向构建沙箱，
+    必须显式携带并在运行时设置 TCL_LIBRARY/TK_LIBRARY（"用到哪个取哪个"）。"""
+    import re
+
+    pat = re.compile(r"^\s*(?:import\s+_?tkinter\b|from\s+_?tkinter\b)", re.M)
+    try:
+        for rel in _project_files(spec.project_dir):
+            if not rel.suffix == ".py":
+                continue
+            p = spec.project_dir / rel
+            try:
+                if pat.search(p.read_text(encoding="utf-8", errors="ignore")):
+                    return True
+            except OSError:
+                continue
+    except Exception:  # noqa: BLE001  扫描失败按不携带处理
+        return False
+    return False
+
+
 # ---------------------------------------------------------------- 产物组装
 
 def _assemble(
@@ -728,8 +963,10 @@ def _assemble(
     bundle.mkdir(parents=True)
     shutil.copy2(pyz, bundle / "app.pyz")
     # 保留符号链接（bin/python3 -> python3.12 等）：归档/压缩包按链接存储，
-    # 避免目标文件被重复打包；Windows runtime 无符号链接，不受影响
+    # 避免目标文件被重复打包；Windows runtime 无符号链接，不受影响。
+    # 运行时缓存保存全量内容，打包阶段对副本按需裁剪（不用的不进产物）
     shutil.copytree(runtime, bundle / "runtime", symlinks=True)
+    prune_runtime(bundle / "runtime", logger)
 
     if spec.platform == "windows":
         launcher = bundle / f"{spec.name}.cmd"
@@ -768,6 +1005,9 @@ def _assemble(
                 artifact,
                 cert=Path(spec.sign_cert) if spec.sign_cert else None,
                 key=Path(spec.sign_key) if spec.sign_key else None,
+                pfx=Path(spec.sign_pfx) if spec.sign_pfx else None,
+                pfx_pass=spec.sign_pfx_pass,
+                timestamp_url=spec.sign_timestamp or None,
                 logger=logger,
             )
         return [artifact]
@@ -781,7 +1021,14 @@ def _assemble(
                                         console=not spec.windowed,
                                         app_name=spec.name)
         if spec.platform == "macos" and spec.app_wrap:
-            return [artifact, _wrap_mac_app(artifact, spec, logger)]
+            wrapped = _wrap_mac_app(artifact, spec, logger)
+            if spec.sign:  # 需求 58: app_wrap 壳随打包页签名选项一起签
+                from pythub.signing import sign_macos_app
+
+                sign_macos_app(wrapped, identity=spec.sign_identity,
+                               entitlements=spec.entitlements or None,
+                               logger=logger)
+            return [artifact, wrapped]
         return [artifact]
 
     if fmt == "tar.gz":
@@ -804,51 +1051,82 @@ def _assemble(
         dest = out / formats.deb_file_name(spec.name, spec.version, arch)
         if dest.exists():
             dest.unlink()
-        return [formats.make_deb(
+        artifacts = [formats.make_deb(
             bundle, out,
             name=spec.name, version=spec.version, arch=arch,
             maintainer=spec.maintainer, description=spec.description,
             windowed=spec.windowed,
         )]
+        if spec.sign:  # 需求 62: deb GPG 签名（工具缺失时告警跳过）
+            _sign_linux_package(artifacts, spec, logger)
+        return artifacts
 
     if fmt == "rpm" and spec.platform == "linux":
         # RPM 包: 自研 cpio/header（三端可交叉）或 rpmbuild（mac/linux 构建机可选）；
         # 文件名沿用 RPM 规范（{name}-{version}-{release}.{arch}.rpm）
-        return [formats.make_rpm(
+        artifacts = [formats.make_rpm(
             bundle, out,
             name=spec.name, version=spec.version, arch=arch,
             maintainer=spec.maintainer, description=spec.description,
             license=spec.license, windowed=spec.windowed,
             engine=spec.rpm_engine,
         )]
+        if spec.sign:  # 需求 62: rpm GPG 签名（工具/密钥缺失时告警跳过）
+            _sign_linux_package(artifacts, spec, logger)
+        return artifacts
 
     if spec.platform == "macos":
         staging = work / "stage"
         staging.mkdir(parents=True)
-        app = formats.build_app_bundle(staging, spec.name, spec.version, runtime, pyz,
+        # 使用裁剪后的 bundle runtime（app/dmg/pkg 与 dir/tar.gz 裁剪策略一致）
+        app = formats.build_app_bundle(staging, spec.name, spec.version,
+                                       bundle / "runtime", pyz,
                                        logger, bundle_id=spec.bundle_id)
+        if spec.sign:  # 需求 58: sign=true 且平台 macos 时 codesign 签名
+            from pythub.signing import sign_macos_app
+
+            sign_macos_app(app, identity=spec.sign_identity,
+                           entitlements=spec.entitlements or None,
+                           logger=logger)
         if fmt == "app":
             dest = out / f"{_tag(spec)}.app"
             if dest.exists():
                 shutil.rmtree(dest)
             shutil.copytree(app, dest, symlinks=True)
+            if spec.notarize:  # 需求 65: 公证 + staple
+                _notarize_artifact(dest, spec, logger)
             return [dest]
         if fmt == "dmg":
             dest = out / f"{_tag(spec)}.dmg"
             if dest.exists():
                 dest.unlink()
-            return [formats.make_dmg(staging, dest, spec.name)]
+            artifacts = [formats.make_dmg(staging, dest, spec.name)]
+            if spec.notarize:
+                _notarize_artifact(artifacts[0], spec, logger)
+            return artifacts
         if fmt == "pkg":
             dest = out / f"{_tag(spec)}.pkg"
             if dest.exists():
                 dest.unlink()
-            return [formats.make_pkg(staging, dest, spec.name, spec.version)]
+            pkg_sign = ""
+            if spec.sign:
+                if spec.sign_identity:
+                    pkg_sign = spec.sign_identity
+                else:
+                    logger.warning(
+                        "  pkg 格式不支持 ad-hoc 签名（需受信任的签名身份），已跳过 pkg 签名")
+            artifacts = [formats.make_pkg(staging, dest, spec.name, spec.version,
+                                          sign_identity=pkg_sign)]
+            if spec.notarize:
+                _notarize_artifact(artifacts[0], spec, logger)
+            return artifacts
 
     if fmt == "appimage" and spec.platform == "linux":
         dest = out / f"{_tag(spec)}.AppImage"
         if dest.exists():
             dest.unlink()
-        result = formats.make_appimage(work / "stage", dest, spec.name, runtime, pyz, logger)
+        result = formats.make_appimage(work / "stage", dest, spec.name, runtime, pyz, logger,
+                                       sign_key=spec.sign_gpg_key if spec.sign else "")
         if result:
             return [result]
         logger.warning("未找到 appimagetool，降级为单文件 .run（自解压可执行，无需任何工具）。")

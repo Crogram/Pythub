@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -55,6 +56,34 @@ class _QueueHandler(logging.Handler):
 # ------------------------------------------------ 日志弹窗（需求 40/41）
 
 
+def _center_window(win, parent=None, width=None, height=None):
+    """窗口打开前自动居中（先隐藏、一次性定位、再显示，避免左上角闪烁）。
+
+    先 withdraw 阻止窗口以默认位置映射，计算居中坐标后一次性写入完整
+    "WxH+X+Y"，最后 deiconify——窗口首次显示即在居中位置。width/height
+    未给时取窗口请求尺寸（winfo_reqwidth/reqheight，未映射前也可用；
+    不能用 win.geometry()——withdraw 后返回 1x1）。parent 给定时相对
+    父窗口居中（弹窗跟随主窗口），否则相对屏幕居中（主窗口）。
+    """
+    win.withdraw()
+    win.update_idletasks()
+    if width is None:
+        width = win.winfo_reqwidth()
+    if height is None:
+        height = win.winfo_reqheight()
+    if parent is not None and parent.winfo_exists() and parent.winfo_ismapped():
+        parent.update_idletasks()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+    else:
+        px, py = 0, 0
+        pw, ph = win.winfo_screenwidth(), win.winfo_screenheight()
+    x = px + max((pw - width) // 2, 0)
+    y = py + max((ph - height) // 2, 0)
+    win.geometry(f"{width}x{height}+{x}+{y}")
+    win.deiconify()
+
+
 class _LogWindow:
     """独立日志查看弹窗: 暗色只读文本区 + 自动刷新。
 
@@ -70,6 +99,7 @@ class _LogWindow:
         self.win = tk.Toplevel(root)
         self.win.title(title)
         self.win.geometry("760x480")
+        _center_window(self.win, root, 760, 480)
         self.file_path = file_path
         self.reload_ms = reload_ms
         self.bar = ttk.Frame(self.win)
@@ -231,8 +261,9 @@ class PythubGUI:
         self.last_dir = Path.home()
 
         root.title("Pythub")
-        root.geometry("880x666")
-        root.minsize(880, 666)
+        root.geometry("880x700")
+        root.minsize(880, 700)
+        _center_window(root, width=880, height=700)
 
         nb = ttk.Notebook(root)
         self.nb = nb
@@ -458,42 +489,80 @@ class PythubGUI:
                           lambda _e: self._update_windowed_hint())
         self._update_windowed_hint()
 
-        # mem 内存执行模式（仅 exe/pexe 格式生效）
-        self.var_mem = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            opt, text="mem 内存执行（源码字节码内嵌、全程不落盘，后缀 .mem.exe/.mem.pexe）",
-            variable=self.var_mem).grid(
-            row=6, column=1, columnspan=4, sticky="w", padx=6)
+        # 内存模式（需求 23/64，仅 exe/pexe 格式生效）: disk/mem/embed
+        row_mem = ttk.Frame(opt)
+        row_mem.grid(row=6, column=1, columnspan=4, sticky="w", padx=6)
+        ttk.Label(row_mem, text="内存模式:").pack(side="left")
+        self.var_mem_mode = tk.StringVar(value="disk")
+        self.cmb_mem = ttk.Combobox(
+            row_mem, textvariable=self.var_mem_mode,
+            values=["disk", "mem", "embed", "static"], state="readonly", width=7)
+        self.cmb_mem.pack(side="left", padx=6)
+        self.lbl_mem_hint = ttk.Label(row_mem, text="", foreground="#777")
+        self.lbl_mem_hint.pack(side="left", padx=4)
+        self.cmb_mem.bind("<<ComboboxSelected>>",
+                          lambda e: self._mem_mode_hint())
+        self._mem_mode_hint()
 
         self.var_sign = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            opt, text="Authenticode 签名（仅 .exe，未提供证书时自动生成自签证书）",
+            opt, text="签名（.exe: Authenticode / macos: codesign / deb·rpm: GPG）",
             variable=self.var_sign).grid(
             row=7, column=1, columnspan=4, sticky="w", padx=6)
+
+        # 签名与证书管理（需求 57/58/62）: 独立弹窗配置，选定后回显在打包页
+        row_sign = ttk.Frame(opt)
+        row_sign.grid(row=8, column=1, columnspan=4, sticky="w", padx=6, pady=(2, 0))
+        ttk.Button(row_sign, text="签名管理…", width=12,
+                   command=self._open_sign_dialog).pack(side="left")
+        self.var_sign_identity = tk.StringVar(value="")   # 空 = ad-hoc
+        self.var_sign_gpg_key = tk.StringVar(value="")    # deb/rpm GPG 密钥，空 = 默认
+        self.var_sign_choice = tk.StringVar(
+            value="codesign: Ad-hoc（默认） | GPG: 默认密钥 | 时间戳: 无")
+        ttk.Label(row_sign, textvariable=self.var_sign_choice, foreground="#777").pack(
+            side="left", padx=6)
+
+        row_cert = ttk.Frame(opt)
+        row_cert.grid(row=9, column=1, columnspan=4, sticky="w", padx=6, pady=(2, 0))
+        ttk.Button(row_cert, text="证书管理…", width=12,
+                   command=self._open_cert_dialog).pack(side="left")
+        self.var_sign_cert = tk.StringVar(value="")
+        self.var_sign_key = tk.StringVar(value="")
+        self.var_sign_pfx = tk.StringVar(value="")        # PKCS#12 单文件证书
+        self.var_sign_pfx_pass = tk.StringVar(value="")   # .p12/.pfx 密码
+        self.var_sign_timestamp = tk.StringVar(value="")  # RFC3161 时间戳地址
+        self.var_notarize = tk.BooleanVar(value=False)    # macOS 公证
+        self.var_apple_id = tk.StringVar(value="")        # 公证 Apple ID
+        self.var_apple_password = tk.StringVar(value="")  # 公证应用专用密码
+        self.var_team_id = tk.StringVar(value="")         # 公证 Team ID
+        self.var_entitlements = tk.StringVar(value="")    # entitlements plist
+        self.var_cert_choice = tk.StringVar(value="自动自签证书（默认）")
+        ttk.Label(row_cert, textvariable=self.var_cert_choice, foreground="#777").pack(
+            side="left", padx=6)
 
         # 可执行产物自动加执行权限（需求 29: run/pexe/pyz 等）
         self.var_chmod = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             opt, text="为可执行产物添加执行权限（run/pexe/pyz 等，chmod +x）",
             variable=self.var_chmod).grid(
-            row=8, column=1, columnspan=4, sticky="w", padx=6)
+            row=10, column=1, columnspan=4, sticky="w", padx=6)
 
         # mac pexe 再打包为 .app 壳（Finder 识别为应用）
         self.var_app_wrap = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             opt, text="mac pexe 再打包为 .app 壳（Finder 识别为应用，适合 GUI）",
             variable=self.var_app_wrap).grid(
-            row=9, column=1, columnspan=4, sticky="w", padx=6)
+            row=11, column=1, columnspan=4, sticky="w", padx=6)
 
         # rpm 包引擎选择（需求 36: mac/linux 构建机可选自研或 rpmbuild）
-        ttk.Label(opt, text="RPM 引擎:").grid(row=10, column=0, sticky="e", padx=4, pady=2)
+        ttk.Label(opt, text="RPM 引擎:").grid(row=12, column=0, sticky="e", padx=4, pady=2)
         self.var_rpm_engine = tk.StringVar(value="auto")
         ttk.Combobox(opt, textvariable=self.var_rpm_engine,
                      values=["auto", "self", "rpmbuild"],
-                     state="readonly", width=10).grid(row=10, column=1, sticky="w", padx=6)
+                     state="readonly", width=10).grid(row=12, column=1, sticky="w", padx=6)
         ttk.Label(opt, text="auto=有 rpmbuild 则用；self=自研（三端可交叉）；"
                            "rpmbuild=仅 mac/linux 构建机", foreground="#777").grid(
-            row=10, column=2, columnspan=3, sticky="w")
+            row=12, column=2, columnspan=3, sticky="w")
 
         self.var_status = tk.StringVar(value="就绪")
         ttk.Label(f, textvariable=self.var_status, foreground="#367bf0").pack(padx=8, anchor="w")
@@ -583,6 +652,17 @@ class PythubGUI:
         self.var_fmt.set(fmts[0] if fmts else "")
         self._update_windowed_hint()
 
+    def _mem_mode_hint(self):
+        """内存模式说明（需求 23/64）。"""
+        hints = {
+            "disk": "常规解压执行（默认）",
+            "mem": "源码字节码内嵌、内存执行，产物 .mem.*",
+            "embed": "内嵌解释器: dlopen PBS libpython，落盘 2-3 文件，产物 .embed.*",
+            "static": "静态内嵌: 解释器链进入口二进制，零落盘，产物 .static.*；Windows 需本机构建",
+        }
+        self.lbl_mem_hint.config(
+            text=hints.get(self.var_mem_mode.get(), ""), foreground="#777")
+
     def _update_windowed_hint(self):
         """窗口模式选项提示: 仅 pythub 引擎的 exe/pexe 引导器消费 console 参数。"""
         if not hasattr(self, "lbl_windowed_hint"):
@@ -669,8 +749,21 @@ class PythubGUI:
             output=Path(self.ent_output.real_value().strip() or project.resolve() / "dist"),  # 需求 42/43: 自定义输出目录，placeholder 视为空
             engine=self.var_engine.get(),
             windowed=self.var_windowed.get(),
-            mem=self.var_mem.get(),
+            mem=self.var_mem_mode.get() == "mem",
+            mem_mode=self.var_mem_mode.get(),
             sign=self.var_sign.get(),
+            sign_cert=self.var_sign_cert.get().strip(),
+            sign_key=self.var_sign_key.get().strip(),
+            sign_identity=self.var_sign_identity.get().strip(),
+            sign_gpg_key=self.var_sign_gpg_key.get().strip(),
+            sign_pfx=self.var_sign_pfx.get().strip(),
+            sign_pfx_pass=self.var_sign_pfx_pass.get().strip(),
+            sign_timestamp=self.var_sign_timestamp.get().strip(),
+            notarize=self.var_notarize.get(),
+            apple_id=self.var_apple_id.get().strip(),
+            apple_password=self.var_apple_password.get(),
+            team_id=self.var_team_id.get().strip(),
+            entitlements=self.var_entitlements.get().strip(),
             chmod=self.var_chmod.get(),
             app_wrap=self.var_app_wrap.get(),
             rpm_engine=self.var_rpm_engine.get(),
@@ -708,6 +801,395 @@ class PythubGUI:
                 self.root.after(0, lambda err=e: finish_err(err))
 
         threading.Thread(target=work, daemon=True).start()
+
+    # ------------------------------------------------ 签名 / 证书管理（需求 57/58）
+
+    def _open_sign_dialog(self):
+        """签名管理弹窗（统一签名中心）: macOS codesign 身份 + deb/rpm GPG 密钥
+        （需求 58/62），选定后合并回显到打包页。"""
+        from pythub.signing import codesign_tool, list_codesign_identities, list_gpg_keys
+
+        has_codesign = bool(codesign_tool())
+        has_gpg = bool(list_gpg_keys())  # 先探测，供提示文案
+        identities = list_codesign_identities() if has_codesign else []
+
+        win = tk.Toplevel(self.root)
+        win.title("签名管理")
+        win.geometry("640x640")
+        win.transient(self.root)
+        win.grab_set()
+        _center_window(win, self.root, 640, 640)
+
+        hint = ("macOS: 选择 codesign 签名身份（构建机为 mac 且钥匙串含有效"
+                "证书时可枚举）；\n"
+                "deb/rpm: 选择 GPG 密钥（rpm 签名必须指定，deb 留空用 gpg 默认密钥）；\n"
+                "Windows .exe 的 Authenticode 证书请在「证书管理」中配置。")
+        if not has_codesign:
+            hint += "\n（本机未找到 codesign，仅可选择 Ad-hoc；构建时将跳过 mac 签名）"
+        ttk.Label(win, text=hint, foreground="#777",
+                  wraplength=600, justify="left").pack(anchor="w", padx=12, pady=(10, 6))
+
+        def _pick(ent, title, ft=None):
+            p = filedialog.askopenfilename(title=f"选择{title}", parent=win,
+                                           filetypes=ft or [])
+            if p:
+                ent.delete(0, "end")
+                ent.insert(0, p)
+
+        # 区块 1: macOS codesign 身份（需求 58）
+        lbl_cs = ttk.Label(win, text="macOS codesign 签名身份:")
+        lbl_cs.pack(anchor="w", padx=12)
+        lb = tk.Listbox(win, activestyle="dotbox", height=6)
+        lb.pack(fill="both", expand=True, padx=12, pady=(2, 6))
+
+        def _fill_codesign():
+            nonlocal identities
+            identities = list_codesign_identities() if codesign_tool() else []
+            lb.delete(0, "end")
+            lb.insert("end", "Ad-hoc 临时签名（无需证书，不获系统信任）")
+            for _h, name in identities:
+                lb.insert("end", name)
+            lb.selection_clear(0, "end")
+            cur = self.var_sign_identity.get().strip()
+            if cur:
+                for i, (_h, name) in enumerate(identities, 1):
+                    if name == cur:
+                        lb.selection_set(i)
+                        lb.see(i)
+                        break
+                else:
+                    lb.selection_set(0)
+            else:
+                lb.selection_set(0)
+
+        _fill_codesign()
+
+        # 区块 2: deb/rpm GPG 密钥（需求 62）
+        lbl_gpg = ttk.Label(win, text="deb/rpm 签名 GPG 密钥（gpg 私钥）:")
+        lbl_gpg.pack(anchor="w", padx=12)
+        lb_gpg = tk.Listbox(win, activestyle="dotbox", height=5)
+        lb_gpg.pack(fill="both", expand=True, padx=12, pady=(2, 6))
+        gpg_keys = list_gpg_keys()
+
+        def _fill_gpg():
+            nonlocal gpg_keys
+            gpg_keys = list_gpg_keys()
+            lb_gpg.delete(0, "end")
+            lb_gpg.insert("end", "不使用 GPG 密钥（deb 签名将尝试默认密钥）")
+            for kid, name in gpg_keys:
+                lb_gpg.insert("end", f"{name} ({kid})")
+            lb_gpg.selection_clear(0, "end")
+            cur = self.var_sign_gpg_key.get().strip()
+            if cur:
+                for i, (kid, _name) in enumerate(gpg_keys, 1):
+                    if kid == cur:
+                        lb_gpg.selection_set(i)
+                        lb_gpg.see(i)
+                        break
+                else:
+                    lb_gpg.selection_set(0)
+            else:
+                lb_gpg.selection_set(0)
+            if not gpg_keys:
+                lbl_gpg.config(text="deb/rpm 签名 GPG 密钥（本机未找到 gpg 或无私钥，"
+                                    "brew install gnupg / apt install gnupg）:")
+
+        _fill_gpg()
+
+        # 区块 3: Windows .exe RFC3161 时间戳（可选，正式证书建议填写）
+        frm_ts = ttk.Frame(win)
+        frm_ts.pack(fill="x", padx=12, pady=(0, 4))
+        ttk.Label(frm_ts, text="时间戳(RFC3161):").pack(side="left")
+        ent_ts = ttk.Entry(frm_ts)
+        ent_ts.pack(side="left", fill="x", expand=True, padx=6)
+        ent_ts.insert(0, self.var_sign_timestamp.get())
+        ttk.Label(frm_ts, text="如 http://timestamp.digicert.com（空=不加）",
+                  foreground="#777").pack(side="left")
+
+        # 区块 4: macOS 公证（Gatekeeper 分发）与 entitlements（需求 65）
+        lf_not = ttk.LabelFrame(win, text="macOS 公证（notarization）与权限声明", padding=8)
+        lf_not.pack(fill="x", padx=12, pady=(4, 6))
+        row_n0 = ttk.Frame(lf_not)
+        row_n0.pack(anchor="w", pady=(0, 4))
+        ttk.Checkbutton(row_n0, text="构建后公证并 staple（分发到其他 mac 的 Gatekeeper 要求）",
+                        variable=self.var_notarize).pack(side="left")
+        row_n1 = ttk.Frame(lf_not)
+        row_n1.pack(fill="x", pady=2)
+        ttk.Label(row_n1, text="Apple ID:", width=12).pack(side="left")
+        ent_aid = ttk.Entry(row_n1)
+        ent_aid.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ent_aid.insert(0, self.var_apple_id.get())
+        ttk.Label(row_n1, text="专用密码:", width=10).pack(side="left")
+        ent_apass = ttk.Entry(row_n1, show="*")
+        ent_apass.pack(side="left", fill="x", expand=True)
+        ent_apass.insert(0, self.var_apple_password.get())
+        row_n2 = ttk.Frame(lf_not)
+        row_n2.pack(fill="x", pady=2)
+        ttk.Label(row_n2, text="Team ID:", width=12).pack(side="left")
+        ent_tid = ttk.Entry(row_n2, width=16)
+        ent_tid.pack(side="left", padx=(0, 10))
+        ent_tid.insert(0, self.var_team_id.get())
+        ttk.Label(row_n2, text="entitlements:", width=13).pack(side="left")
+        ent_ent = ttk.Entry(row_n2)
+        ent_ent.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        ent_ent.insert(0, self.var_entitlements.get())
+        ttk.Button(row_n2, text="浏览", width=6,
+                   command=lambda: _pick(
+                       ent_ent, "entitlements plist",
+                       ft=[("Plist", "*.plist"), ("全部文件", "*")])).pack(side="left")
+        ttk.Label(lf_not, text="应用专用密码在 appleid.apple.com 生成（非登录密码）；"
+                              "密码仅保存在本次会话，不会写入 settings.json。",
+                  foreground="#777").pack(anchor="w", pady=(4, 0))
+
+        def confirm():
+            sel = lb.curselection()
+            if not sel:
+                messagebox.showwarning("签名管理", "请选择 macOS 签名身份", parent=win)
+                return
+            idx = sel[0]
+            if idx == 0:
+                self.var_sign_identity.set("")
+            else:
+                self.var_sign_identity.set(identities[idx - 1][1])
+            sel_gpg = lb_gpg.curselection()
+            if not sel_gpg:
+                messagebox.showwarning("签名管理", "请选择 GPG 密钥项", parent=win)
+                return
+            gidx = sel_gpg[0]
+            if gidx == 0:
+                self.var_sign_gpg_key.set("")
+            else:
+                self.var_sign_gpg_key.set(gpg_keys[gidx - 1][0])
+            cs = self.var_sign_identity.get().strip() or "Ad-hoc"
+            gpg = self.var_sign_gpg_key.get().strip()
+            gpg_disp = gpg if gpg else "默认密钥"
+            ts = ent_ts.get().strip()
+            self.var_sign_timestamp.set(ts)
+            # 公证信息写回
+            self.var_apple_id.set(ent_aid.get().strip())
+            self.var_apple_password.set(ent_apass.get())
+            self.var_team_id.set(ent_tid.get().strip())
+            self.var_entitlements.set(ent_ent.get().strip())
+            if self.var_notarize.get() and not (
+                    self.var_apple_id.get() and self.var_apple_password.get()):
+                messagebox.showwarning(
+                    "签名管理", "勾选公证需填写 Apple ID 与应用专用密码", parent=win)
+                return
+            notar = (self.var_apple_id.get().split("@")[0]
+                     if self.var_notarize.get() else "否")
+            ts_disp = "无" if not ts else ts.split("//")[-1].rstrip("/")
+            self.var_sign_choice.set(
+                f"codesign: {cs} | GPG: {gpg_disp} | 时间戳: {ts_disp}"
+                f" | 公证: {notar}")
+            win.destroy()
+
+        btnrow = ttk.Frame(win)
+        btnrow.pack(pady=6)
+        ttk.Button(btnrow, text="刷新列表",
+                   command=lambda: (_fill_codesign(), _fill_gpg())).pack(
+            side="left", padx=4)
+        ttk.Button(btnrow, text="确定", command=confirm).pack(side="left", padx=4)
+        ttk.Button(btnrow, text="取消", command=win.destroy).pack(side="left", padx=4)
+
+    def _open_cert_dialog(self):
+        """证书管理弹窗（需求 57）: 缓存路径展示、打开目录、清理自签证书，
+        自定义 Authenticode 证书/私钥选择（Windows .exe），以及 macOS
+        开发者证书的钥匙串加载与 .p12 导入。"""
+        import tkinter.simpledialog as simpledialog
+        from pythub.signing import CERT_DIR, list_codesign_identities
+
+        win = tk.Toplevel(self.root)
+        win.title("证书管理")
+        win.geometry("640x580")
+        win.transient(self.root)
+        win.grab_set()
+        _center_window(win, self.root, 640, 580)
+
+        # 1) 自签证书缓存（需求 57）
+        lf1 = ttk.LabelFrame(win, text="自签证书缓存（Authenticode 自动生成）", padding=8)
+        lf1.pack(fill="x", padx=12, pady=(10, 6))
+        ttk.Label(lf1, text=f"缓存目录: {CERT_DIR}", foreground="#777").pack(anchor="w")
+        var_cert_status = tk.StringVar()
+        ttk.Label(lf1, textvariable=var_cert_status, foreground="#777").pack(
+            anchor="w", pady=(2, 6))
+
+        def _refresh_cert_status():
+            crt = CERT_DIR / "selfsigned.crt"
+            key = CERT_DIR / "selfsigned.key"
+            if crt.exists() and key.exists():
+                var_cert_status.set("状态: 存在 selfsigned.crt / selfsigned.key")
+            else:
+                var_cert_status.set("状态: 暂无（首次签名时自动生成，10 年有效期）")
+
+        row1 = ttk.Frame(lf1)
+        row1.pack(anchor="w")
+        ttk.Button(row1, text="打开证书目录",
+                   command=self._open_cert_cache_dir).pack(side="left")
+        ttk.Button(row1, text="清理自签证书",
+                   command=lambda: (self._clean_selfsigned_cert(),
+                                    _refresh_cert_status())).pack(side="left", padx=6)
+        _refresh_cert_status()
+
+        # 2) 自定义证书（Windows .exe Authenticode）
+        lf2 = ttk.LabelFrame(win, text="自定义证书（Windows .exe Authenticode）", padding=8)
+        lf2.pack(fill="x", padx=12, pady=6)
+        ttk.Label(lf2, text="PEM: 证书 (.crt/.pem) 与私钥 (.key/.pem) 成对提供；"
+                            "PKCS12: 单文件 .p12/.pfx（正式 CA 证书常见格式）+ 密码；"
+                            "均留空则自动自签。\n"
+                            "deb/rpm 的 GPG 签名密钥在「签名管理」弹窗中选择"
+                            "（gpg 钥匙串，非文件证书）。").pack(anchor="w")
+        row2 = ttk.Frame(lf2)
+        row2.pack(fill="x", pady=4)
+        ttk.Label(row2, text="证书:", width=6).pack(side="left")
+        ent_cert = ttk.Entry(row2)
+        ent_cert.pack(side="left", fill="x", expand=True, padx=4)
+        ent_cert.insert(0, self.var_sign_cert.get())
+        row3 = ttk.Frame(lf2)
+        row3.pack(fill="x", pady=4)
+        ttk.Label(row3, text="私钥:", width=6).pack(side="left")
+        ent_key = ttk.Entry(row3)
+        ent_key.pack(side="left", fill="x", expand=True, padx=4)
+        ent_key.insert(0, self.var_sign_key.get())
+
+        def _pick(ent, title, ft=None):
+            p = filedialog.askopenfilename(title=f"选择{title}", parent=win,
+                                           filetypes=ft or [])
+            if p:
+                ent.delete(0, "end")
+                ent.insert(0, p)
+
+        ttk.Button(row2, text="浏览", width=6,
+                   command=lambda: _pick(ent_cert, "证书文件")).pack(side="left")
+        ttk.Button(row3, text="浏览", width=6,
+                   command=lambda: _pick(ent_key, "私钥文件")).pack(side="left")
+        # PKCS#12 单文件模式（CA 颁发的正式代码签名证书常见格式）
+        row4 = ttk.Frame(lf2)
+        row4.pack(fill="x", pady=4)
+        ttk.Label(row4, text="PKCS12:", width=6).pack(side="left")
+        ent_pfx = ttk.Entry(row4)
+        ent_pfx.pack(side="left", fill="x", expand=True, padx=4)
+        ent_pfx.insert(0, self.var_sign_pfx.get())
+        ent_pass = ttk.Entry(row4, show="*", width=14)
+        ent_pass.pack(side="left", padx=(0, 4))
+        ent_pass.insert(0, self.var_sign_pfx_pass.get())
+        ttk.Label(row4, text="密码", foreground="#777").pack(side="left")
+        ttk.Button(row4, text="浏览", width=6,
+                   command=lambda: _pick(
+                       ent_pfx, "PKCS#12 证书",
+                       ft=[("PKCS#12 证书", "*.p12 *.pfx"), ("全部文件", "*")])).pack(side="left")
+        if sys.platform == "darwin":
+            lf3 = ttk.LabelFrame(win, text="macOS 开发者证书（登录钥匙串）", padding=8)
+            lf3.pack(fill="both", expand=True, padx=12, pady=6)
+            ttk.Label(lf3, text="钥匙串中的 Apple 开发者证书"
+                               "（Apple Development / Apple Distribution /"
+                               " Developer ID）即 codesign 签名身份，导入后可在"
+                               "「签名管理」中选用。").pack(anchor="w")
+            lb_cert = tk.Listbox(lf3, activestyle="dotbox", height=5)
+            lb_cert.pack(fill="both", expand=True, pady=(4, 4))
+
+            def _fill_mac_certs():
+                lb_cert.delete(0, "end")
+                idents = list_codesign_identities()
+                if not idents:
+                    lb_cert.insert("end", "（钥匙串暂无可用的代码签名身份）")
+                    lb_cert.itemconfig(0, foreground="#999")
+                    return
+                for _h, name in idents:
+                    lb_cert.insert("end", name)
+
+            def _import_mac_cert():
+                p = filedialog.askopenfilename(
+                    title="选择开发者证书文件",
+                    filetypes=[("开发者证书", "*.p12 *.pfx *.cer *.crt"),
+                               ("全部文件", "*")],
+                    parent=win)
+                if not p:
+                    return
+                password = ""
+                if p.lower().endswith((".p12", ".pfx")):
+                    password = simpledialog.askstring(
+                        "证书密码", "请输入 .p12 导出密码（无密码可留空）:",
+                        show="*", parent=win)
+                    if password is None:  # 用户取消
+                        return
+                try:
+                    from pythub.signing import import_macos_cert
+
+                    out = import_macos_cert(p, password)
+                except RuntimeError as e:
+                    messagebox.showerror("导入证书", str(e), parent=win)
+                    return
+                _fill_mac_certs()
+                messagebox.showinfo(
+                    "导入证书",
+                    f"导入完成。\n{out}\n\n导入的身份已可在「签名管理」弹窗中选用。",
+                    parent=win)
+                self.var_status.set("开发者证书导入完成 ✓")
+
+            def _open_keychain_access():
+                subprocess.Popen(["open", "-a", "Keychain Access"])
+
+            row_cert_mac = ttk.Frame(lf3)
+            row_cert_mac.pack(anchor="w")
+            ttk.Button(row_cert_mac, text="导入 .p12/.cer 证书",
+                       command=_import_mac_cert).pack(side="left")
+            ttk.Button(row_cert_mac, text="刷新列表",
+                       command=_fill_mac_certs).pack(side="left", padx=6)
+            ttk.Button(row_cert_mac, text="打开钥匙串访问",
+                       command=_open_keychain_access).pack(side="left")
+            _fill_mac_certs()
+        else:
+            ttk.Label(win, text="macOS 开发者证书管理仅支持 macOS 构建机。",
+                      foreground="#999").pack(anchor="w", padx=12)
+
+        def confirm():
+            cert = ent_cert.get().strip()
+            key = ent_key.get().strip()
+            pfx = ent_pfx.get().strip()
+            if pfx and (cert or key):
+                messagebox.showwarning(
+                    "证书管理",
+                    "PKCS#12 单文件与 PEM 证书/私钥二选一，不可混用", parent=win)
+                return
+            if bool(cert) != bool(key):
+                messagebox.showwarning(
+                    "证书管理", "证书与私钥必须成对提供（或均留空以自动自签）", parent=win)
+                return
+            self.var_sign_cert.set(cert)
+            self.var_sign_key.set(key)
+            self.var_sign_pfx.set(pfx)
+            self.var_sign_pfx_pass.set(ent_pass.get())
+            if pfx:
+                self.var_cert_choice.set(f"已选: {Path(pfx).name} (PKCS#12)")
+            elif cert:
+                self.var_cert_choice.set(f"已选: {Path(cert).name}")
+            else:
+                self.var_cert_choice.set("自动自签证书")
+            win.destroy()
+
+        btnrow = ttk.Frame(win)
+        btnrow.pack(pady=8)
+        ttk.Button(btnrow, text="确定", command=confirm).pack(side="left", padx=4)
+        ttk.Button(btnrow, text="取消", command=win.destroy).pack(side="left", padx=4)
+
+    def _open_cert_cache_dir(self):
+        """需求 57: 打开自签证书缓存目录（不存在时先创建）。"""
+        from pythub.signing import CERT_DIR
+
+        CERT_DIR.mkdir(parents=True, exist_ok=True)
+        self._open_dir(CERT_DIR)
+
+    def _clean_selfsigned_cert(self):
+        """需求 57: 清理自签证书（下次签名自动重新生成）。"""
+        from pythub.signing import CERT_DIR
+
+        if not messagebox.askyesno(
+                "清理自签证书",
+                "删除 selfsigned.crt / selfsigned.key？\n下次签名时自动重新生成。"):
+            return
+        for name in ("selfsigned.crt", "selfsigned.key"):
+            (CERT_DIR / name).unlink(missing_ok=True)
+        self.var_status.set("自签证书已清理 ✓")
 
     # ------------------------------------------------ 发布页
 
@@ -1660,6 +2142,27 @@ class PythubGUI:
                   foreground="#777", wraplength=680, justify="left").pack(
             anchor="w", pady=(2, 0))
         self._refresh_cache_stats()
+
+        # ---- 证书管理（需求 57）----
+        from pythub.signing import CERT_DIR
+
+        frm_cert = ttk.LabelFrame(f, text="证书管理", padding=8)
+        frm_cert.pack(fill="x", padx=8, pady=8)
+        ttk.Label(frm_cert, text=f"自签证书缓存目录: {CERT_DIR}", justify="left").pack(
+            anchor="w")
+        ttk.Label(frm_cert,
+                  text="Windows .exe Authenticode 自动自签证书"
+                       "（selfsigned.crt / selfsigned.key）存储于此，10 年有效期；"
+                       "清理后下次签名时自动重新生成。打包页「证书管理」弹窗亦可维护；"
+                       "deb/rpm 签名使用 gpg 钥匙串密钥，在「签名管理」弹窗中选择。",
+                  foreground="#777", wraplength=680, justify="left").pack(
+            anchor="w", pady=(2, 6))
+        row_cert = ttk.Frame(frm_cert)
+        row_cert.pack(anchor="w")
+        ttk.Button(row_cert, text="打开证书目录",
+                   command=self._open_cert_cache_dir).pack(side="left")
+        ttk.Button(row_cert, text="清理自签证书",
+                   command=self._clean_selfsigned_cert).pack(side="left", padx=6)
 
     def _save_cache_cap(self):
         from pythub.utils import cache_max_bytes, set_cache_max_mb

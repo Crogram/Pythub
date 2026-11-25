@@ -41,6 +41,15 @@ TRIPLETS = {
     ("windows", "x86_64"): "x86_64-pc-windows-msvc-shared",
 }
 
+# static 模式 full 变体三元组覆盖: Windows 需要**非 shared**变体
+# （x86_64-pc-windows-msvc, python.exe 静态链接核心）——其 build/core/*.obj
+# 为 /MT 静态 CRT 且静态引用 Py 符号，可链接为无 python312.dll 的单文件
+# 解释器；shared 变体的 objs 走 python312.dll 导入（__imp_Py*），不能用于
+# 静态链接。其余平台 full 变体本身即静态库形态，无需覆盖。
+TRIPLETS_FULL = {
+    ("windows", "x86_64"): "x86_64-pc-windows-msvc",
+}
+
 
 def detect_current() -> Tuple[str, str, str]:
     import platform
@@ -246,9 +255,11 @@ def resolve_runtime(pyver: str) -> Tuple[str, str]:
     return idx["tag"], full
 
 
-def runtime_dir(platform: str, arch: str, pyver: str) -> Path:
+def runtime_dir(platform: str, arch: str, pyver: str, kind: str = "install_only") -> Path:
     tag, full = resolve_runtime(pyver)
-    return PYTHUB_CACHE_DIR / "runtimes" / f"cpython-{full}-{tag}-{platform}-{arch}"
+    suffix = "-full" if kind == "full" else ""
+    return PYTHUB_CACHE_DIR / "runtimes" / (
+        f"cpython-{full}-{tag}-{platform}-{arch}{suffix}")
 
 
 def fetch_runtime(
@@ -256,37 +267,60 @@ def fetch_runtime(
     arch: str,
     pyver: str,
     logger: Optional[logging.Logger] = None,
+    kind: str = "install_only",
 ) -> Path:
     """获取（必要时下载）目标平台嵌入式解释器目录。
 
-    并发安全: 先在暂存目录完成下载/解压/瘦身并写入 .pythub-ok 标记，
+    kind="install_only"（默认）: install_only_stripped/install_only 变体
+    （tar.gz，npmmirror 镜像可用），目录布局为标准运行时树。
+
+    kind="full": pgo-full 完整发行变体（tar.zst，仅 GitHub 提供），额外
+    携带构建期构件——libpython3.x.a 静态库、include/ 头文件、第三方依赖
+    静态库（crypto/ssl/expat/ffi/tcl/tk 等，位于 python/build/lib/），
+    供 static 内存模式（需求 64）静态链接解释器使用。缓存布局:
+    install/（标准运行时树）+ build/（构建期构件）。
+
+    缓存保存**全量内容**（不预裁剪）；打包阶段由 builder 对 staging 副本
+    按产物类型按需裁剪（prune_runtime），缓存本体始终完整（embed/static
+    等模式需要头文件之外的完整构件）。
+
+    并发安全: 先在暂存目录完成下载/解压并写入 .pythub-ok 标记（含 full），
     再原子 rename 到最终位置；若另一进程抢先完成（缓存已就位），直接
     复用其结果，避免半成品目录被并发进程误删/误用。"""
     triplet = TRIPLETS.get((platform, arch))
     if not triplet:
         raise ValueError(f"不支持的 目标平台/架构: {platform}/{arch}")
+    if kind == "full":
+        triplet = TRIPLETS_FULL.get((platform, arch), triplet)
     tag, full = resolve_runtime(pyver)
-    cache = PYTHUB_CACHE_DIR / "runtimes" / f"cpython-{full}-{tag}-{platform}-{arch}"
+    # Windows full 用非 shared 变体（独立缓存目录, 避免与 shared 变体冲突）
+    suffix = ("-full-ns" if (kind == "full" and platform == "windows")
+              else "-full" if kind == "full" else "")
+    cache = PYTHUB_CACHE_DIR / "runtimes" / (
+        f"cpython-{full}-{tag}-{platform}-{arch}{suffix}")
 
     if (cache / ".pythub-ok").exists():
-        # 旧版缓存未瘦身则就地瘦身
         marker = (cache / ".pythub-ok").read_text(encoding="utf-8")
-        if "slim" not in marker:
-            pruned = prune_runtime(cache, logger)
-            if logger and pruned:
-                logger.info("运行时缓存已瘦身: 移除 %s", ", ".join(pruned))
-            (cache / ".pythub-ok").write_text(
-                marker.rstrip("\n") + "\nslim\n", encoding="utf-8"
-            )
-        return cache
+        if "full" in marker:
+            return cache
+        # 旧版"瘦身"缓存已删减内容（新版打包需要全量构件），失效后重新下载
+        if logger:
+            logger.info("旧版瘦身运行时缓存已过时，重新下载完整运行时...")
+        shutil.rmtree(cache, ignore_errors=True)
 
-    # 下载: stripped 变体优先（无调试符号，体积显著更小），缺失回退 install_only；
-    # 下载源按 runtime_sources() 顺序尝试（GitHub → npmmirror / 自定义镜像），
-    # 全部失败才报错；下载后按上游 .sha256 校验完整性
-    variants = [
-        f"cpython-{full}+{tag}-{triplet}-install_only_stripped.tar.gz",
-        f"cpython-{full}+{tag}-{triplet}-install_only.tar.gz",
-    ]
+    if kind == "full":
+        # 完整发行变体: pgo-full 为纯目标文件静态库（pgo+lto-full 的 .a 是
+        # LLVM bitcode，旧版系统链接器无法解析）；上游仅 GitHub 提供，
+        # 镜像源通常 404 会快速跳过
+        variants = [
+            f"cpython-{full}+{tag}-{triplet}-pgo-full.tar.zst",
+        ]
+    else:
+        # 下载: stripped 变体优先（无调试符号，体积显著更小），缺失回退 install_only
+        variants = [
+            f"cpython-{full}+{tag}-{triplet}-install_only_stripped.tar.gz",
+            f"cpython-{full}+{tag}-{triplet}-install_only.tar.gz",
+        ]
 
     import tempfile
 
@@ -334,7 +368,7 @@ def fetch_runtime(
 
         if logger:
             logger.info("解压运行时...")
-        extract_runtime(archive, tmp / "extract")
+        extract_runtime(archive, tmp / "extract", logger=logger)
         root = tmp / "extract" / "python"
         if not root.exists():
             raise RuntimeError(f"压缩包结构异常，缺少 python/ 目录: {archive.name}")
@@ -343,11 +377,14 @@ def fetch_runtime(
         staging = cache.parent / f".{cache.name}.tmp-{os.getpid()}"
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
+        if kind == "full":
+            # full 布局: python/{install,build,...}——整体保留（static 模式
+            # 需要 install/ 运行时树 + build/lib/ 第三方静态库 + include/ 头文件）
+            pass
         shutil.move(str(root), str(staging))
-        pruned = prune_runtime(staging, logger)
-        if logger and pruned:
-            logger.info("运行时瘦身完成: 移除 %s", ", ".join(pruned))
-        (staging / ".pythub-ok").write_text(f"{full}\n{triplet}\nslim\n", encoding="utf-8")
+        # 缓存保存全量内容（不预裁剪）；裁剪延迟到打包阶段对 staging 副本按需进行
+        (staging / ".pythub-ok").write_text(
+            f"{full}\n{triplet}\nfull\n", encoding="utf-8")
 
         # 就位: 另一并发进程可能已完成，双重检查后原子 rename
         if cache.exists():
@@ -367,45 +404,67 @@ def fetch_runtime(
     return cache
 
 
-# ---------------------------------------------------------------- 运行时瘦身
+# ---------------------------------------------------------------- 打包期按需裁剪
 
-# 解压时直接跳过的成员（运行应用用不到的构建期内容；同时规避压缩包内符号链接循环）
-_SKIP_TOP_DIRS = ("include", "share", "libs", "pypy")
-_SKIP_STDLIB_DIRS = (
-    "test", "idlelib", "lib2to3", "pydoc_data", "turtledemo", "ensurepip",
-)
-_SKIP_SITE_DIRS = ("pip", "setuptools", "pkg_resources", "wheel", "_distutils_hack")
-_SKIP_SEGMENTS = ("__pycache__", "demos")
+def extract_runtime(archive: Path, dest: Path, logger=None) -> None:
+    """完整解压运行时 tar 包——不做任何成员过滤，缓存保存全量内容；
+    裁剪延迟到打包阶段由 builder 对 staging 副本按产物类型按需进行。
 
-
-def _runtime_member_keep(name: str) -> bool:
-    """判断 tar 压缩包成员是否保留（相对运行时根 python/ 过滤）。"""
-    parts = [p for p in name.split("/") if p not in ("", ".")]
-    if not parts:
-        return False
-    if any(seg in _SKIP_SEGMENTS for seg in parts):
-        return False
-    if name.endswith(_PRUNE_FILE_SUFFIXES):
-        return False
-    rel = parts[1:] if parts[0] == "python" else parts
-    if rel and rel[0] in _SKIP_TOP_DIRS:
-        return False
-    if len(rel) >= 2 and rel[0] in ("lib", "Lib") and rel[1].startswith("python3"):
-        if len(rel) >= 3 and rel[2] in _SKIP_STDLIB_DIRS:
-            return False
-        if len(rel) >= 4 and rel[2] == "site-packages" and rel[3] in _SKIP_SITE_DIRS:
-            return False
-    return True
-
-
-def extract_runtime(archive: Path, dest: Path) -> None:
-    """解压运行时 tar 包，边解压边跳过无需保留的成员（防符号链接循环、省 IO）。"""
+    个别上游归档（如 PBS 部分构建的 share/terminfo）在文件成员之前携带
+    指向自身/绝对路径的符号链接目录（或硬链接指向链接环成员），常规
+    extractall 会因链接环触发 ELOOP；解压时逐成员容错: 删除构成环的符号
+    链接组件后重试，仍失败（环上别名硬链接）则跳过该成员并告警——
+    终态为真实文件目录，不影响解释器运行。"""
+    import errno as _errno
+    import subprocess
     import tarfile
 
+    dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(archive) as tf:
-        members = [m for m in tf.getmembers() if _runtime_member_keep(m.name)]
-        tf.extractall(dest, members=members)
+
+    actual = archive
+    if str(archive).endswith(".tar.zst"):
+        # zstd 压缩（PBS full 变体）: 标准库 tarfile 不支持，经系统 zstd
+        # 预解压为 tar 后按常规流程处理
+        import shutil as _sh
+
+        zstd = _sh.which("zstd")
+        if not zstd:
+            raise RuntimeError(
+                "解压 .tar.zst 需要 zstd 工具（brew install zstd / apt install zstd）")
+        tar_tmp = archive.with_suffix(".tar")
+        with open(tar_tmp, "wb") as out:
+            r = subprocess.run([zstd, "-d", "-c", str(archive)], stdout=out,
+                               stderr=subprocess.PIPE)
+        if r.returncode != 0:
+            raise RuntimeError(f"zstd 解压失败: {r.stderr.decode(errors='replace')[:300]}")
+        actual = tar_tmp
+
+    skipped = []
+    with tarfile.open(actual) as tf:
+        for m in tf:
+            try:
+                tf.extract(m, dest)
+                continue
+            except OSError as e:
+                if e.errno != _errno.ELOOP:
+                    raise
+            # ELOOP: 该成员路径上存在构成环的符号链接组件，删除后重试
+            probe = dest / m.name
+            while probe != dest and probe != probe.parent:
+                probe = probe.parent
+                if probe.is_symlink():
+                    probe.unlink()
+                    break
+            try:
+                tf.extract(m, dest)
+                continue
+            except OSError:
+                skipped.append(m.name)  # 环上别名/硬链接: 跳过（正主文件已单独解出）
+    if skipped and logger:
+        logger.warning(
+            "运行时归档含符号链接环，跳过 %d 个别名成员（不影响运行）: %s",
+            len(skipped), ", ".join(skipped[:5]) + ("..." if len(skipped) > 5 else ""))
 
 
 # 运行时根目录下可整体移除的目录（头文件/文档/静态链接库等构建期内容）
@@ -414,13 +473,17 @@ _PRUNE_ROOT_DIRS = ("include", "share", "libs", "pypy", "lib/pkgconfig")
 # 标准库内可安全移除的目录（运行应用用不到）
 _PRUNE_STDLIB_DIRS = (
     "test", "idlelib", "lib2to3", "pydoc_data", "turtledemo", "ensurepip",
+    "__phello__", "__pycache__",
     "site-packages/pip", "site-packages/setuptools", "site-packages/pkg_resources",
     "site-packages/wheel", "site-packages/_distutils_hack",
     "site-packages/setuptools-*.dist-info", "site-packages/pip-*.dist-info",
 )
 
-# bin 内无需保留的工具脚本（保留 python3 本体）
+# bin 内无需保留的工具脚本（保留 python 本体）
 _BIN_PRUNE_PREFIXES = ("idle", "pydoc", "2to3", "pip", "wheel", "easy_install")
+
+# bin 内无需保留的文件后缀（python3-config/python3.X-config: 构建扩展时才用）
+_BIN_PRUNE_SUFFIXES = ("-config",)
 
 # 调试符号与静态库文件
 _PRUNE_FILE_SUFFIXES = (".pdb", ".a", ".lib", ".pyo")
@@ -441,8 +504,12 @@ def _find_stdlib_dirs(runtime: Path) -> list:
 
 
 def prune_runtime(runtime: Path, logger=None) -> list:
-    """就地瘦身运行时：移除调试符号、测试套件、pip/setuptools、文档、__pycache__，
-    并 strip 二进制符号表（unix）。典型可减小 50%~80% 体积。返回移除内容类别列表。"""
+    """就地裁剪运行时副本（打包期使用）：移除调试符号、测试套件、pip/setuptools、
+    文档、__pycache__，并 strip 二进制符号表（unix）。典型可减小 50%~80% 体积。
+
+    注意: 缓存本体保存全量内容（fetch_runtime 不裁剪），本函数作用于打包
+    时复制到 staging/bundle 的副本，按产物类型按需取用、不用的不进产物。
+    返回移除内容类别列表。"""
     import subprocess
 
     is_windows = (runtime / "python.exe").exists()
@@ -476,6 +543,10 @@ def prune_runtime(runtime: Path, logger=None) -> list:
             for d in stdlib.glob(pat):
                 if rm_dir(d):
                     n += 1
+        # 构建配置目录（Makefile/libpython.a 等，编译扩展时才用）
+        for d in stdlib.glob("config-*"):
+            if rm_dir(d):
+                n += 1
     if n:
         removed_kinds.append("test/idlelib/pip等stdlib冗余包")
 
@@ -484,7 +555,9 @@ def prune_runtime(runtime: Path, logger=None) -> list:
     for bindir in (runtime / "bin", runtime / "Scripts"):
         if bindir.is_dir():
             for f in bindir.iterdir():
-                if f.name.startswith(_BIN_PRUNE_PREFIXES):
+                if f.name.startswith(_BIN_PRUNE_PREFIXES) or \
+                        (f.name.endswith(_BIN_PRUNE_SUFFIXES)
+                         and f.stem.startswith("python")):
                     n += rm_file(f)
     if n:
         removed_kinds.append("bin工具脚本")

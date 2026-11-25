@@ -56,6 +56,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <signal.h>
+#include <dlfcn.h> /* embed 模式: 进程内 dlopen libpython（需求 64） */
 #include <sys/file.h>
 #include <sys/wait.h>
 #endif
@@ -73,6 +74,48 @@
 /* mem 模式 TOC 条目路径 */
 #define MEM_BOOT_REL "app.boot" /* Python 引导器源码 */
 #define MEM_PAYLOAD_REL "app.mem" /* 应用字节码（裸 marshal） */
+
+/* embed 内嵌解释器模式（需求 64）TOC 条目: FLAG_MEM 载荷（解压不落盘），
+ * embed 分支主动写到缓存后 dlopen libpython 进程内初始化解释器。
+ * "Python 进内存"的 OS 层最佳近似: 引导器进程即 Python 进程，无需解压
+ * 独立 python 可执行目录；落盘仅 libpython + stdlib.zip 两个文件。 */
+#define EMBED_PYLIB_REL "app.pylib"  /* libpython 共享库（PBS 运行时） */
+#define EMBED_STDLZ_REL "app.stdlz"  /* stdlib zip（zipimport 直接导入） */
+#define EMBED_STDLZF_REL "app.stdlzf" /* stdlib frozen 字节码（static 模式） */
+#define EMBED_TCLTK_REL "app.tcltk"  /* Tcl/Tk 数据目录 zip（可选, 引导器落盘,
+                                      * runner 释放为真实文件并设 TCL_LIBRARY） */
+#define APP_WDLLS_REL "app.wdlls"    /* Windows static 第三方依赖 DLL zip
+                                      * （openssl/sqlite3 导入库对应 DLL,
+                                      * runner 释放到缓存供 PATH 搜索） */
+#ifdef _WIN32
+#define EMBED_PYLIB_CACHE "libpython.dll"
+#else
+#ifdef __APPLE__
+#define EMBED_PYLIB_CACHE "libpython.dylib"
+#else
+#define EMBED_PYLIB_CACHE "libpython.so"
+#endif
+#endif
+
+/* 参数注入: [自身路径, 用户参数...] 逐项 base64 后逗号连接（env 无法携带 \0） */
+static size_t b64_encode(const uint8_t *src, size_t n, char *out)
+{
+    static const char tab[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t o = 0;
+    for (size_t i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)src[i] << 16;
+        int pad = (n - i) < 2 ? 1 : 0;
+        if (i + 1 < n) v |= (uint32_t)src[i + 1] << 8;
+        if (i + 2 < n) v |= src[i + 2];
+        out[o++] = tab[(v >> 18) & 63];
+        out[o++] = tab[(v >> 12) & 63];
+        out[o++] = pad ? '=' : tab[(v >> 6) & 63];
+        out[o++] = (n - i) < 3 ? '=' : tab[v & 63];
+    }
+    out[o] = 0;
+    return o;
+}
 
 /* 解释器 -c 一行加载器: 从环境变量 PYTHUB_BOOT 读入引导器源码并 exec */
 #define MEM_MINI_LOADER "import os;exec(os.environ['PYTHUB_BOOT'])"
@@ -372,6 +415,55 @@ static void entry_md5(const uint8_t *buf, uint64_t toc_offset, uint8_t digest[16
     uint8_t *infl = entry_payload(buf + doff, stored, raw, flags);
     md5_1(infl ? infl : buf + doff, infl ? raw : stored, digest);
     free(infl);
+}
+#endif
+
+#ifdef PYTHUB_STATIC
+/* static 模式公共: 解释器内嵌进引导器，需要 Python.h 与 frozen 注册。
+ * POSIX 与 Windows 的 spawn_static_* 共用 frozen 注册逻辑。 */
+#include <Python.h>
+
+/* 解析 frozen blob（打包期由 exe_archive 生成）:
+ * [u32 count]{[u16 namelen][name][u8 is_pkg][u32 codelen][marshal]}
+ * 直接引用归档缓冲区（零拷贝，进程存活期内有效），注册到
+ * PyImport_FrozenModules（3.12 pre-init 时全局表为 NULL, 无需合并）。 */
+static void bootex_register_frozen(const uint8_t *buf, uint64_t toc_offset)
+{
+    uint8_t *data;
+    size_t len;
+    int heap;
+    mem_entry_load(buf, toc_offset, EMBED_STDLZF_REL, &data, &len, &heap);
+    const uint8_t *p = data;
+    const uint8_t *end = data + len;
+    uint32_t count = rd32(p);
+    p += 4;
+    struct _frozen *tbl = calloc(count + 1, sizeof(struct _frozen));
+    if (!tbl)
+        die("frozen 表内存分配失败");
+    for (uint32_t i = 0; i < count && p + 3 <= end; i++) {
+        uint16_t nl = (uint16_t)(p[0] | (p[1] << 8));
+        p += 2;
+        if (p + nl + 9 > end)
+            die("frozen blob 损坏");
+        tbl[i].name = (const char *)p;
+        p += nl;
+        tbl[i].is_package = *p++;
+        uint32_t cl = rd32(p);
+        p += 4;
+        if (p + cl > end)
+            die("frozen blob 代码段越界");
+        tbl[i].code = (const unsigned char *)p;
+        p += cl;
+        tbl[i].size = (int)cl;
+#if PY_VERSION_HEX >= 0x030C0000
+        tbl[i].get_code = NULL; /* 直接使用 code/size 内存数据 */
+#endif
+    }
+    tbl[count].name = NULL;
+    tbl[count].code = NULL;
+    tbl[count].size = 0;
+    tbl[count].get_code = NULL;
+    PyImport_FrozenModules = tbl;
 }
 #endif
 
@@ -878,6 +970,269 @@ static int spawn_mem_w(const wchar_t *cache, const uint8_t *buf, uint64_t toc_of
     return (int)code;
 }
 
+/* embed 内嵌解释器模式（需求 64, Windows）: 引导器进程内 LoadLibrary
+ * libpython + GetProcAddress 初始化解释器并执行引导器源码。
+ * 应用结束经 SystemExit -> os._exit 直接退出本进程（退出码即应用退出码）。 */
+static int spawn_embed_w(const wchar_t *cache, const uint8_t *buf,
+                         uint64_t toc_offset)
+{
+    /* 解出 libpython 与 stdlib.zip 到缓存（仅两个文件） */
+    uint8_t *data;
+    size_t dlen;
+    int heap;
+    wchar_t pylib[32768], stdlz[32768];
+    /* 确保缓存目录存在（常规路径由 extract_atomic_w 创建，embed 跳过了） */
+    {
+        wchar_t parent[32768];
+        _snwprintf_s(parent, 32768, _TRUNCATE, L"%ls", cache);
+        wchar_t *slash = wcsrchr(parent, L'\\');
+        if (slash) {
+            *slash = 0;
+            CreateDirectoryW(parent, NULL); /* <exe_root>\<app> */
+        }
+        CreateDirectoryW(cache, NULL); /* <exe_root>\<app>\<md5> */
+    }
+    mem_entry_load(buf, toc_offset, EMBED_PYLIB_REL, &data, &dlen, &heap);
+    _snwprintf_s(pylib, 32768, _TRUNCATE, L"%ls\\%ls", cache, L"" EMBED_PYLIB_CACHE);
+    write_file_w(pylib, data, dlen);
+    if (heap)
+        free(data);
+    mem_entry_load(buf, toc_offset, EMBED_STDLZ_REL, &data, &dlen, &heap);
+    _snwprintf_s(stdlz, 32768, _TRUNCATE, L"%ls\\stdlib.zip", cache);
+    write_file_w(stdlz, data, dlen);
+    if (heap)
+        free(data);
+
+    /* Tcl/Tk 数据 zip（可选常规条目）: 落盘到缓存，runner 释放真实文件目录 */
+    {
+        uint64_t toff;
+        uint32_t tst, trw;
+        uint8_t tfl;
+        if (toc_find(buf, toc_offset, EMBED_TCLTK_REL, &toff, &tst, &trw, &tfl)) {
+            uint8_t *tk = entry_payload(buf + toff, tst, trw, tfl);
+            const uint8_t *tksrc = tk ? tk : (buf + toff);
+            size_t tklen = tk ? trw : tst;
+            wchar_t wtkp[32768];
+            wchar_t wrel[64];
+            MultiByteToWideChar(CP_UTF8, 0, EMBED_TCLTK_REL, -1, wrel, 64);
+            _snwprintf_s(wtkp, 32768, _TRUNCATE, L"%ls\\%ls", cache, wrel);
+            write_file_w(wtkp, tksrc, tklen);
+            if (tk)
+                free(tk);
+        }
+    }
+
+    /* 环境变量注入（runner 内 pop）: PYTHONPATH 交给 zipimport；argv 逐项
+     * base64 逗号连接（首项为自身路径，与 mem 模式 sys.argv 语义对齐） */
+    wchar_t wstdlz[32768];
+    wchar_t wname[64];
+    MultiByteToWideChar(CP_UTF8, 0, EMBED_PYLIB_CACHE, -1, wname, 64);
+    _snwprintf_s(wstdlz, 32768, _TRUNCATE, L"%ls\\%ls", cache, wname);
+    (void)wstdlz;
+    wchar_t wzip[32768];
+    _snwprintf_s(wzip, 32768, _TRUNCATE, L"%ls\\stdlib.zip", cache);
+    SetEnvironmentVariableW(L"PYTHONPATH", wzip);
+    SetEnvironmentVariableW(L"PYTHONIOENCODING", L"utf-8");
+
+    wchar_t self[32768];
+    if (!GetModuleFileNameW(NULL, self, 32768))
+        die("无法获取自身路径");
+    SetEnvironmentVariableW(L"PYTHUB_SELF", self);
+    SetEnvironmentVariableW(L"PYTHUB_EXE_CACHE", cache); /* 缓存目录（runner 释放 tcl/tk 用） */
+
+    char b64[65536];
+    size_t bo = 0;
+    int nArgs = 0;
+    wchar_t **cl = CommandLineToArgvW(GetCommandLineW(), &nArgs);
+    if (!cl)
+        die("命令行解析失败");
+    for (int i = 0; i < nArgs && bo + 8 < sizeof(b64); i++) {
+        int utf8len = WideCharToMultiByte(CP_UTF8, 0, cl[i], -1,
+                                          NULL, 0, NULL, NULL);
+        char *item = (char *)malloc((size_t)utf8len);
+        if (!item)
+            die("内存不足");
+        WideCharToMultiByte(CP_UTF8, 0, cl[i], -1, item, utf8len, NULL, NULL);
+        size_t itemlen = strlen(item);
+        if (i > 0)
+            b64[bo++] = ',';
+        bo += b64_encode((const uint8_t *)item, itemlen, b64 + bo);
+        free(item);
+    }
+    LocalFree(cl);
+    b64[bo] = 0;
+    wchar_t *warg = utf8w(b64);
+    SetEnvironmentVariableW(L"PYTHUB_EMBED_ARGV", warg);
+    free(warg);
+
+    /* 进程内加载解释器 */
+    HMODULE h = LoadLibraryW(pylib);
+    if (!h)
+        die("无法加载 libpython (GetLastError=%lu)", GetLastError());
+    void (*py_init)(void) = (void (*)(void))GetProcAddress(h, "Py_Initialize");
+    int (*py_run)(const char *) =
+        (int (*)(const char *))GetProcAddress(h, "PyRun_SimpleString");
+    if (!py_init || !py_run)
+        die("libpython 缺少嵌入式初始化符号");
+
+    uint8_t *boot;
+    size_t bootlen;
+    int boot_heap;
+    mem_entry_load(buf, toc_offset, MEM_BOOT_REL, &boot, &bootlen, &boot_heap);
+    char *bootz = (char *)malloc(bootlen + 1);
+    if (!bootz)
+        die("内存不足");
+    memcpy(bootz, boot, bootlen);
+    bootz[bootlen] = 0;
+
+    py_init();
+    int r = py_run(bootz); /* runner 以 os._exit 收尾，正常不会到达这里 */
+    if (boot_heap)
+        free(boot);
+    free(bootz);
+    return r == 0 ? 0 : 1;
+}
+
+#ifdef PYTHUB_STATIC
+/* static 内存模式（需求 64 第四档, Windows）: 解释器核心（PBS build/core
+ * objs）与扩展模块 objs 静态链接进本二进制，stdlib frozen 注册——除
+ * 第三方依赖 DLL（openssl/sqlite3, 经 app.wdlls 携带）外零落盘。
+ * 扩展模块 init 由 pythub_extinit.c（打包期生成）注册 PyImport_Inittab。 */
+extern void pythub_register_extensions(void);
+
+static int spawn_static_w(const wchar_t *cache, const uint8_t *buf,
+                          uint64_t toc_offset)
+{
+    /* 缓存目录（mkdir_parents_w 处理父目录） */
+    {
+        wchar_t parent[32768];
+        _snwprintf_s(parent, 32768, _TRUNCATE, L"%ls", cache);
+        wchar_t *slash = wcsrchr(parent, L'\\');
+        if (slash) {
+            *slash = 0;
+            mkdir_parents_w(parent);
+        }
+        CreateDirectoryW(cache, NULL);
+    }
+
+    /* 自身路径（unicode 安全） */
+    wchar_t selfw[32768];
+    if (!GetModuleFileNameW(NULL, selfw, 32768))
+        die("无法定位自身路径");
+    int su8len = WideCharToMultiByte(CP_UTF8, 0, selfw, -1, NULL, 0, NULL, NULL);
+    char *selfu8 = (char *)malloc((size_t)su8len);
+    if (!selfu8)
+        die("内存不足");
+    WideCharToMultiByte(CP_UTF8, 0, selfw, -1, selfu8, su8len, NULL, NULL);
+
+    /* app.wdlls zip（第三方依赖 DLL）+ app.tcltk zip: 落盘到缓存，
+     * runner 解压（wdlls → 缓存根, DLL 经 PATH 前置的缓存目录搜索加载） */
+    {
+        const char *zip_rels[] = {APP_WDLLS_REL, EMBED_TCLTK_REL};
+        for (int zi = 0; zi < 2; zi++) {
+            uint64_t toff;
+            uint32_t tst, trw;
+            uint8_t tfl;
+            if (!toc_find(buf, toc_offset, zip_rels[zi], &toff, &tst, &trw, &tfl))
+                continue;
+            uint8_t *zp = entry_payload(buf + toff, tst, trw, tfl);
+            const uint8_t *zsrc = zp ? zp : (buf + toff);
+            size_t zlen = zp ? trw : tst;
+            wchar_t *zpw = utf8w(zip_rels[zi]);
+            if (!zpw)
+                die("内存不足");
+            wchar_t zpath[32768];
+            _snwprintf_s(zpath, 32768, _TRUNCATE, L"%ls\\%ls", cache, zpw);
+            free(zpw);
+            write_file_w(zpath, zsrc, zlen);
+            if (zp)
+                free(zp);
+        }
+    }
+
+    /* PATH 前置缓存目录: 依赖 DLL（libcrypto-3-x64.dll 等）由 runner 解压
+     * 到缓存后，_ssl/_sqlite3 等静态扩展在 import 期经 PATH 搜索加载 */
+    {
+        wchar_t old[32768];
+        wchar_t newp[65536];
+        DWORD n = GetEnvironmentVariableW(L"PATH", old, 32768);
+        if (n > 0 && n < 32768)
+            _snwprintf_s(newp, 65536, _TRUNCATE, L"%ls;%ls", cache, old);
+        else
+            _snwprintf_s(newp, 65536, _TRUNCATE, L"%ls", cache);
+        SetEnvironmentVariableW(L"PATH", newp);
+    }
+
+    /* stdlib frozen 字节码注册（公共逻辑） */
+    bootex_register_frozen(buf, toc_offset);
+
+    /* 扩展模块注册（_ssl/_socket/pyexpat 等, 打包期生成表） */
+    pythub_register_extensions();
+
+    /* 环境变量注入 */
+    SetEnvironmentVariableW(L"PYTHONIOENCODING", L"utf-8");
+    {
+        wchar_t *v = utf8w(selfu8);
+        if (!v)
+            die("内存不足");
+        SetEnvironmentVariableW(L"PYTHUB_SELF", v);
+        free(v);
+    }
+    SetEnvironmentVariableW(L"PYTHUB_EXE_CACHE", cache);
+    /* argv: GetCommandLineW → utf8 → base64 逗号连接（unicode 参数安全） */
+    {
+        int n;
+        wchar_t **cl = CommandLineToArgvW(GetCommandLineW(), &n);
+        if (cl) {
+            size_t cap = (size_t)(n > 0 ? n : 1) * 4 * 32768 + 16;
+            char *b64 = (char *)malloc(cap);
+            if (!b64)
+                die("内存不足");
+            size_t bo = 0;
+            for (int i = 0; i < n; i++) {
+                int u8len = WideCharToMultiByte(CP_UTF8, 0, cl[i], -1, NULL,
+                                                0, NULL, NULL);
+                char *item = (char *)malloc((size_t)u8len);
+                if (!item)
+                    die("内存不足");
+                WideCharToMultiByte(CP_UTF8, 0, cl[i], -1, item, u8len,
+                                    NULL, NULL);
+                if (i > 0)
+                    b64[bo++] = ',';
+                bo += b64_encode((const uint8_t *)item, strlen(item), b64 + bo);
+                free(item);
+            }
+            LocalFree(cl);
+            b64[bo] = 0;
+            wchar_t *warg = utf8w(b64);
+            if (!warg)
+                die("内存不足");
+            SetEnvironmentVariableW(L"PYTHUB_EMBED_ARGV", warg);
+            free(warg);
+            free(b64);
+        }
+    }
+    free(selfu8);
+
+    uint8_t *boot;
+    size_t bootlen;
+    int boot_heap;
+    mem_entry_load(buf, toc_offset, MEM_BOOT_REL, &boot, &bootlen, &boot_heap);
+    char *bootz = (char *)malloc(bootlen + 1);
+    if (!bootz)
+        die("内存不足");
+    memcpy(bootz, boot, bootlen);
+    bootz[bootlen] = 0;
+
+    Py_Initialize(); /* 解释器就在本二进制内——链接期符号，直接调用 */
+    int r = PyRun_SimpleString(bootz); /* runner 以 os._exit 收尾 */
+    if (boot_heap)
+        free(boot);
+    free(bootz);
+    return r == 0 ? 0 : 1;
+}
+#endif /* PYTHUB_STATIC (Windows) */
+
 #if defined(GUI_APP) && defined(_WIN32)
 int main(int argc, char **argv);
 /* -mwindows 使 PE 入口为 WinMainCRTStartup，需提供 WinMain 符号。
@@ -928,6 +1283,31 @@ int main(int argc, char **argv)
     _snwprintf_s(appdir, 32768, _TRUNCATE, L"%ls\\%ls", exe_root, wapp);
     _snwprintf_s(cache, 32768, _TRUNCATE, L"%ls\\%ls", appdir, wmd5);
 
+    /* static/embed/mem 模式检测（需求 23/64）: 必须在常规解压之前——
+     * mem/embed/static 归档无 ENTRY 常规条目（载荷全部 FLAG_MEM；embed 的
+     * tcl/tk 数据条目由 spawn_embed 自行落盘），走到 extract 会误报"启动器
+     * 未生成"。static 归档含 stdlzf 条目（frozen blob），优先于 mem 分发 */
+    {
+        uint64_t mdoff;
+        uint32_t mst, mrw;
+        uint8_t mfl;
+#ifdef PYTHUB_STATIC
+        if (toc_find(buf, toc_offset, EMBED_STDLZF_REL, &mdoff, &mst, &mrw, &mfl)) {
+            int rc = spawn_static_w(cache, buf, toc_offset);
+            free(buf);
+            return rc;
+        }
+#endif
+        int embed_mode = toc_find(buf, toc_offset, EMBED_PYLIB_REL, &mdoff, &mst, &mrw, &mfl);
+        int mem_mode = toc_find(buf, toc_offset, MEM_BOOT_REL, &mdoff, &mst, &mrw, &mfl);
+        if (embed_mode || mem_mode) {
+            int rc = embed_mode ? spawn_embed_w(cache, buf, toc_offset)
+                                : spawn_mem_w(cache, buf, toc_offset);
+            free(buf);
+            return rc;
+        }
+    }
+
     wchar_t entry[32768];
     _snwprintf_s(entry, 32768, _TRUNCATE, L"%ls\\%ls", cache, ENTRY_REL);
     int re_extract = 0;
@@ -956,14 +1336,9 @@ int main(int argc, char **argv)
     }
     free(wapp);
     free(wmd5);
-    /* mem 模式检测: 归档含 app.boot 内存载荷条目时走内存执行路径 */
+    /* 常规解压执行（mem/embed 已在上方提前分发） */
     {
-        uint64_t mdoff;
-        uint32_t mst, mrw;
-        uint8_t mfl;
-        int mem_mode = toc_find(buf, toc_offset, MEM_BOOT_REL, &mdoff, &mst, &mrw, &mfl);
-        int rc = mem_mode ? spawn_mem_w(cache, buf, toc_offset)
-                          : spawn_w(cache, argc, argv);
+        int rc = spawn_w(cache, argc, argv);
         free(buf);
         return rc;
     }
@@ -1369,6 +1744,20 @@ static int spawn_n(const char *cache, int argc, char **argv)
     if (chdir(cache) != 0)
         die("无法进入缓存目录");
 
+    /* Tcl/Tk 数据目录定位（PBS 构建的 libpython 静态内嵌 _tkinter，数据
+     * 查找路径指向构建沙箱）: 存在则导出环境变量（不覆盖用户设置） */
+    {
+        char tclchk[PATH_MAX * 2];
+        snprintf(tclchk, sizeof(tclchk), "%s/runtime/lib/tcl8.6/init.tcl", cache);
+        if (access(tclchk, F_OK) == 0) {
+            char tcllib[PATH_MAX * 2], tklib[PATH_MAX * 2];
+            snprintf(tcllib, sizeof(tcllib), "%s/runtime/lib/tcl8.6", cache);
+            snprintf(tklib, sizeof(tklib), "%s/runtime/lib/tk8.6", cache);
+            setenv("TCL_LIBRARY", tcllib, 0);
+            setenv("TK_LIBRARY", tklib, 0);
+        }
+    }
+
     char **child = (char **)malloc((size_t)(argc + 2) * sizeof(char *));
     child[0] = entry;
     child[1] = pyz;
@@ -1467,6 +1856,247 @@ static int spawn_mem_n(const char *cache, int argc, char **argv,
     return WIFEXITED(st) ? WEXITSTATUS(st) : 1;
 }
 
+/* embed 内嵌解释器模式（需求 64, POSIX）: 引导器进程内 dlopen libpython +
+ * dlsym 初始化解释器并执行引导器源码。应用结束经 SystemExit -> os._exit
+ * 直接退出本进程（退出码即应用退出码）。 */
+static int spawn_embed_n(const char *cache, int argc, char **argv,
+                         const uint8_t *buf, uint64_t toc_offset)
+{
+    /* 解出 libpython 与 stdlib.zip 到缓存（仅两个文件，相比 mem 模式整个
+     * 运行时目录树大幅减少落盘与首次解压开销） */
+    uint8_t *data;
+    size_t dlen;
+    int heap;
+    char pylib[PATH_MAX], stdlz[PATH_MAX];
+    snprintf(pylib, sizeof(pylib), "%s/%s", cache, EMBED_PYLIB_CACHE);
+    snprintf(stdlz, sizeof(stdlz), "%s/stdlib.zip", cache);
+    /* 确保缓存目录存在（常规路径由 extract_atomic_n 创建，embed 跳过了） */
+    {
+        char parent[PATH_MAX];
+        snprintf(parent, sizeof(parent), "%s", cache);
+        char *slash = strrchr(parent, '/');
+        if (slash) {
+            *slash = 0;
+            mkdir(parent, 0755); /* <exe_root>/<app> */
+        }
+        mkdir(cache, 0755); /* <exe_root>/<app>/<md5> */
+    }
+    mem_entry_load(buf, toc_offset, EMBED_PYLIB_REL, &data, &dlen, &heap);
+    write_file_n(pylib, data, dlen);
+    if (heap)
+        free(data);
+    mem_entry_load(buf, toc_offset, EMBED_STDLZ_REL, &data, &dlen, &heap);
+    write_file_n(stdlz, data, dlen);
+    if (heap)
+        free(data);
+
+    /* Tcl/Tk 数据 zip（可选常规条目）: 落盘到缓存，runner 解出 tcl8.6/tk8.6
+     * 真实文件目录并设置 TCL_LIBRARY/TK_LIBRARY（Tcl 无法走 zipimport） */
+    {
+        uint64_t toff;
+        uint32_t tst, trw;
+        uint8_t tfl;
+        if (toc_find(buf, toc_offset, EMBED_TCLTK_REL, &toff, &tst, &trw, &tfl)) {
+            uint8_t *tk = entry_payload(buf + toff, tst, trw, tfl);
+            const uint8_t *tksrc = tk ? tk : (buf + toff);
+            size_t tklen = tk ? trw : tst;
+            char tkp[PATH_MAX];
+            snprintf(tkp, sizeof(tkp), "%s/%s", cache, EMBED_TCLTK_REL);
+            write_file_n(tkp, tksrc, tklen);
+            if (tk)
+                free(tk);
+        }
+    }
+
+    char selfpath[PATH_MAX];
+    if (!realpath(argv[0], selfpath))
+        die("无法定位自身路径");
+
+    /* 环境变量注入（runner 内 pop）: PYTHONPATH=stdlib.zip（zipimport 直接
+     * 从 zip 导入，含 lib-dynload 扩展模块）；PYTHUB_SELF 供 runner 打开
+     * 自身归档解析载荷；argv 逐项 base64 逗号连接（env 无法携带 \0） */
+    setenv("PYTHONPATH", stdlz, 1);
+    setenv("PYTHONIOENCODING", "utf-8", 1); /* 嵌入式环境 locale 检测可能失败 */
+    setenv("PYTHUB_SELF", selfpath, 1);
+    setenv("PYTHUB_EXE_CACHE", cache, 1); /* 缓存目录（runner 释放 tcl/tk 用） */
+    size_t cap = (size_t)argc * 4 * PATH_MAX + 16;
+    char *b64 = (char *)malloc(cap);
+    if (!b64)
+        die("内存不足");
+    size_t bo = 0;
+    for (int i = 0; i < argc; i++) {
+        if (i > 0)
+            b64[bo++] = ',';
+        bo += b64_encode((const uint8_t *)argv[i], strlen(argv[i]), b64 + bo);
+    }
+    b64[bo] = 0;
+    setenv("PYTHUB_EMBED_ARGV", b64, 1);
+    free(b64);
+
+    /* 进程内加载解释器（dlopen 缓存中的 libpython 副本） */
+    void *h = dlopen(pylib, RTLD_NOW | RTLD_GLOBAL);
+    if (!h)
+        die("无法加载 libpython: %s", dlerror());
+    void (*py_init)(void) = (void (*)(void))dlsym(h, "Py_Initialize");
+    int (*py_run)(const char *) =
+        (int (*)(const char *))dlsym(h, "PyRun_SimpleString");
+    if (!py_init || !py_run)
+        die("libpython 缺少嵌入式初始化符号");
+
+    uint8_t *boot;
+    size_t bootlen;
+    int boot_heap;
+    mem_entry_load(buf, toc_offset, MEM_BOOT_REL, &boot, &bootlen, &boot_heap);
+    char *bootz = (char *)malloc(bootlen + 1);
+    if (!bootz)
+        die("内存不足");
+    memcpy(bootz, boot, bootlen);
+    bootz[bootlen] = 0;
+
+    py_init();
+    int r = py_run(bootz); /* runner 以 os._exit 收尾，正常不会到达这里 */
+    if (boot_heap)
+        free(boot);
+    free(bootz);
+    return r == 0 ? 0 : 1;
+}
+
+#ifdef PYTHUB_STATIC
+/* static 内存模式（需求 64 第四档）: 解释器静态链接进本二进制（链接期
+ * 符号直接可用，无需 dlopen），stdlib 以 frozen 字节码注册到
+ * PyImport_FrozenModules——除 GUI 应用 tcl/tk 数据外零落盘。
+ * PYTHUB_STATIC 分支编译时需 -I <PBS runtime>/include/python3.x，
+ * struct _frozen 等定义直接取自目标运行时头文件（跨版本安全）。 */
+#include <Python.h>
+
+static int spawn_static_n(const char *cache, int argc, char **argv,
+                          const uint8_t *buf, uint64_t toc_offset)
+{
+    char parent[PATH_MAX], selfpath[PATH_MAX];
+    snprintf(parent, sizeof(parent), "%s", cache);
+    {
+        char *slash = strrchr(parent, '/');
+        if (slash) {
+            *slash = 0;
+            mkdir(parent, 0755);
+        }
+        mkdir(cache, 0755); /* tcl/tk 数据释放目录（应用引用 tkinter 时） */
+    }
+    if (!realpath(argv[0], selfpath))
+        die("无法定位自身路径");
+
+    /* Tcl/Tk 数据 zip（可选常规条目）: 落盘到缓存（Tcl 需要真实文件，
+     * 是 static 模式唯一的落盘项） */
+    {
+        uint64_t toff;
+        uint32_t tst, trw;
+        uint8_t tfl;
+        if (toc_find(buf, toc_offset, EMBED_TCLTK_REL, &toff, &tst, &trw, &tfl)) {
+            uint8_t *tk = entry_payload(buf + toff, tst, trw, tfl);
+            const uint8_t *tksrc = tk ? tk : (buf + toff);
+            size_t tklen = tk ? trw : tst;
+            char tkp[PATH_MAX];
+            snprintf(tkp, sizeof(tkp), "%s/%s", cache, EMBED_TCLTK_REL);
+            write_file_n(tkp, tksrc, tklen);
+            if (tk)
+                free(tk);
+        }
+    }
+
+    /* stdlib frozen 字节码 → PyImport_FrozenModules（在 Py_Initialize 之前
+     * 注册: encodings 等启动模块即从内存加载，全程不访问文件系统 stdlib）。
+     * blob 格式（mempack.STDLZF_BLOB_FMT）:
+     *   [u32 count] { [u16 namelen][name][u8 is_pkg][u32 codelen][marshal] } */
+    {
+        uint8_t *frozen;
+        size_t flen;
+        int fheap;
+        mem_entry_load(buf, toc_offset, EMBED_STDLZF_REL, &frozen, &flen, &fheap);
+        unsigned int count = 0;
+        memcpy(&count, frozen, 4);
+        struct _frozen *table = (struct _frozen *)calloc(count + 1, sizeof(struct _frozen));
+        if (!table)
+            die("内存不足");
+        const unsigned char *p = frozen + 4;
+        for (unsigned int i = 0; i < count; i++) {
+            unsigned short nl;
+            memcpy(&nl, p, 2); p += 2;
+            char *name = (char *)malloc((size_t)nl + 1);
+            if (!name)
+                die("内存不足");
+            memcpy(name, p, (size_t)nl);
+            name[nl] = 0;
+            p += nl;
+            unsigned int cl;
+            unsigned char ispkg = *p; p += 1;
+            memcpy(&cl, p, 4); p += 4;
+            table[i].name = name;
+            table[i].code = p; /* marshal 字节码直接指向内存 blob（零拷贝） */
+            table[i].size = (int)cl;
+            table[i].is_package = ispkg;
+#if PY_VERSION_HEX >= 0x030C0000
+            table[i].get_code = NULL; /* 直接使用 code/size 内存数据 */
+#endif
+            p += cl;
+        }
+        /* 合并默认表: 3.11 及以下 PyImport_FrozenModules 含 importlib
+         * bootstrap（pre-init 非 NULL）；3.12+ 拆分内部表（pre-init 为
+         * NULL，无需合并）。frozen 数据必须常驻内存（fheap 不释放，
+         * code 指针指向其中，引导器进程生命周期即应用生命周期）。 */
+        if (PyImport_FrozenModules) {
+            int n_orig = 0;
+            while (PyImport_FrozenModules[n_orig].name)
+                n_orig++;
+            struct _frozen *merged = (struct _frozen *)calloc(
+                (size_t)n_orig + count + 1, sizeof(struct _frozen));
+            if (!merged)
+                die("内存不足");
+            memcpy(merged, PyImport_FrozenModules, (size_t)n_orig * sizeof(struct _frozen));
+            memcpy(merged + n_orig, table, (size_t)count * sizeof(struct _frozen));
+            table = merged;
+        }
+        PyImport_FrozenModules = table;
+        (void)flen;
+    }
+
+    /* 环境变量注入（runner 内 pop）: PYTHUB_SELF 供 runner 解析自身归档
+     * 载荷；PYTHUB_EXE_CACHE 供 tcl/tk 释放；argv 逐项 base64 逗号连接 */
+    setenv("PYTHONIOENCODING", "utf-8", 1); /* 嵌入式环境 locale 检测可能失败 */
+    setenv("PYTHUB_SELF", selfpath, 1);
+    setenv("PYTHUB_EXE_CACHE", cache, 1);
+    size_t cap = (size_t)argc * 4 * PATH_MAX + 16;
+    char *b64 = (char *)malloc(cap);
+    if (!b64)
+        die("内存不足");
+    size_t bo = 0;
+    for (int i = 0; i < argc; i++) {
+        if (i > 0)
+            b64[bo++] = ',';
+        bo += b64_encode((const uint8_t *)argv[i], strlen(argv[i]), b64 + bo);
+    }
+    b64[bo] = 0;
+    setenv("PYTHUB_EMBED_ARGV", b64, 1);
+    free(b64);
+
+    uint8_t *boot;
+    size_t bootlen;
+    int boot_heap;
+    mem_entry_load(buf, toc_offset, MEM_BOOT_REL, &boot, &bootlen, &boot_heap);
+    char *bootz = (char *)malloc(bootlen + 1);
+    if (!bootz)
+        die("内存不足");
+    memcpy(bootz, boot, bootlen);
+    bootz[bootlen] = 0;
+
+    Py_Initialize(); /* 解释器就在本二进制内——链接期符号，直接调用 */
+    int r = PyRun_SimpleString(bootz); /* runner 以 os._exit 收尾 */
+    if (boot_heap)
+        free(boot);
+    free(bootz);
+    return r == 0 ? 0 : 1;
+}
+#endif /* PYTHUB_STATIC */
+
 int main(int argc, char **argv)
 {
     size_t len;
@@ -1499,6 +2129,45 @@ int main(int argc, char **argv)
     snprintf(appdir, sizeof(appdir), "%s/%s", exe_root, app);
     snprintf(cache, sizeof(cache), "%s/%s", appdir, md5);
 
+    /* static 模式检测（需求 64 第四档）: stdlzf 条目存在即 static——解释器
+     * 已静态链接进本二进制（PYTHUB_STATIC 编译），零落盘执行 */
+    {
+        uint64_t mdoff;
+        uint32_t mst, mrw;
+        uint8_t mfl;
+        if (toc_find(buf, toc_offset, EMBED_STDLZF_REL, &mdoff, &mst, &mrw, &mfl)) {
+#ifdef PYTHUB_STATIC
+            int rc = spawn_static_n(cache, argc, argv, buf, toc_offset);
+            free(buf);
+            return rc;
+#else
+            die("本引导器未启用 static 模式（PYTHUB_STATIC 编译宏缺失）");
+#endif
+        }
+    }
+
+    /* embed 模式检测（需求 64）: 必须在常规解压之前——embed 归档没有
+     * runtime/ENTRY 常规条目（载荷为 libpython+stdlib 两个 FLAG_MEM 条目，
+     * 由 spawn_embed 自行落盘），走到 extract 会误报"启动器未生成"。
+     * mem 模式（需求 23）归档含完整 runtime 常规条目，走常规解压后再分发。 */
+    {
+        uint64_t mdoff;
+        uint32_t mst, mrw;
+        uint8_t mfl;
+        if (toc_find(buf, toc_offset, EMBED_PYLIB_REL, &mdoff, &mst, &mrw, &mfl)) {
+            int rc = spawn_embed_n(cache, argc, argv, buf, toc_offset);
+            free(buf);
+            return rc;
+        }
+    }
+    int mem_mode = 0;
+    {
+        uint64_t mdoff;
+        uint32_t mst, mrw;
+        uint8_t mfl;
+        mem_mode = toc_find(buf, toc_offset, MEM_BOOT_REL, &mdoff, &mst, &mrw, &mfl);
+    }
+
     char entry[PATH_MAX];
     snprintf(entry, sizeof(entry), "%s/%s", cache, ENTRY_REL);
     int re_extract = 0;
@@ -1525,14 +2194,14 @@ int main(int argc, char **argv)
         cleanup_app_n(appdir, md5);
         enforce_cap_n(exe_root, app);
     }
-    /* mem 模式检测: 归档含 app.boot 内存载荷条目时走内存执行路径 */
+    /* 常规解压执行（embed 已在上方提前分发）: mem 模式需先解出 runtime
+     * 再启动（spawn_mem_n 的子进程 exec cache/runtime/bin/python3） */
     {
-        uint64_t mdoff;
-        uint32_t mst, mrw;
-        uint8_t mfl;
-        int mem_mode = toc_find(buf, toc_offset, MEM_BOOT_REL, &mdoff, &mst, &mrw, &mfl);
-        int rc = mem_mode ? spawn_mem_n(cache, argc, argv, buf, toc_offset)
-                          : spawn_n(cache, argc, argv);
+        int rc;
+        if (mem_mode)
+            rc = spawn_mem_n(cache, argc, argv, buf, toc_offset);
+        else
+            rc = spawn_n(cache, argc, argv);
         free(buf);
         return rc;
     }

@@ -24,11 +24,23 @@ from pythub.exe_archive import (  # noqa: F401  自研单文件打包器
 from pythub.utils import find_executable, make_tar_gz, set_executable, zip_dir
 
 
+_TCL_ENV_SH = (
+    # PBS 构建的 libpython 静态内嵌 _tkinter，但 Tcl 数据查找路径指向其构建
+    # 沙箱；随产物释放的 tcl8.6/tk8.6 数据目录存在时显式导出环境变量
+    'if [ -f "$ROOT/runtime/lib/tcl8.6/init.tcl" ]; then\n'
+    '    export TCL_LIBRARY="$ROOT/runtime/lib/tcl8.6"\n'
+    '    export TK_LIBRARY="$ROOT/runtime/lib/tk8.6"\n'
+    "fi\n"
+)
+
+
 def unix_launcher(main_name: str, python_rel: str, pyz_rel: str) -> str:
     return (
         "#!/bin/sh\n"
         'DIR="$(cd "$(dirname "$0")" && pwd)"\n'
-        f'exec "$DIR/{python_rel}" "$DIR/{pyz_rel}" "$@"\n'
+        'ROOT="$DIR"\n'
+        + _TCL_ENV_SH
+        + f'exec "$DIR/{python_rel}" "$DIR/{pyz_rel}" "$@"\n'
     )
 
 
@@ -36,8 +48,9 @@ def app_launcher(main_name: str) -> str:
     return (
         "#!/bin/sh\n"
         'DIR="$(cd "$(dirname "$0")" && pwd)"\n'
-        'RES="$DIR/../Resources"\n'
-        'exec "$RES/runtime/bin/python3" "$RES/app.pyz" "$@"\n'
+        'ROOT="$DIR/../Resources"\n'
+        + _TCL_ENV_SH
+        + 'exec "$ROOT/runtime/bin/python3" "$ROOT/app.pyz" "$@"\n'
     )
 
 
@@ -52,7 +65,9 @@ def apprun_launcher() -> str:
     return (
         "#!/bin/sh\n"
         'DIR="$(dirname "$(readlink -f "$0")")"\n'
-        'exec "$DIR/runtime/bin/python3" "$DIR/app.pyz" "$@"\n'
+        'ROOT="$DIR"\n'
+        + _TCL_ENV_SH
+        + 'exec "$DIR/runtime/bin/python3" "$DIR/app.pyz" "$@"\n'
     )
 
 
@@ -127,18 +142,22 @@ def make_dmg(src_dir: Path, out: Path, name: str) -> Path:
     return out
 
 
-def make_pkg(src_dir: Path, out: Path, name: str, version: str) -> Path:
+def make_pkg(src_dir: Path, out: Path, name: str, version: str,
+             sign_identity: str = "") -> Path:
     """pkgbuild 打包 PKG（仅 macOS 可用），安装位置为 /Applications。
 
     pkgbuild 默认 --install-location 是 /，应用会被装到文件系统根目录导致"找不到应用"，
     因此显式指定安装到 /Applications。
+    sign_identity: 提供时用 `pkgbuild --sign` 签名（需求 58，需受信任的签名身份，
+    ad-hoc 不适用——由调用方过滤）。
     """
     out.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["pkgbuild", "--root", str(src_dir), "--identifier", f"org.crogram.{name}",
-         "--version", version, "--install-location", "/Applications", str(out)],
-        check=True, capture_output=True,
-    )
+    cmd = ["pkgbuild", "--root", str(src_dir), "--identifier", f"org.crogram.{name}",
+           "--version", version, "--install-location", "/Applications"]
+    if sign_identity:
+        cmd += ["--sign", sign_identity]
+    cmd.append(str(out))
+    subprocess.run(cmd, check=True, capture_output=True)
     return out
 
 
@@ -149,8 +168,12 @@ def make_appimage(
     runtime_src: Path,
     pyz_src: Path,
     logger: Optional[logging.Logger] = None,
+    sign_key: str = "",
 ) -> Optional[Path]:
-    """组装 AppDir 并调用 appimagetool 生成 AppImage。"""
+    """组装 AppDir 并调用 appimagetool 生成 AppImage。
+
+    sign_key 提供 GPG 密钥 ID 时用 `appimagetool --sign --sign-key` 签名
+    （appimagetool 用 gpg2 签名并生成相邻 .sig/.gpg 分离签名文件）。"""
     tool = find_executable("appimagetool")
     if not tool:
         return None
@@ -168,8 +191,12 @@ def make_appimage(
         encoding="utf-8",
     )
     out.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run([tool, str(appdir), str(out)], check=True)
-    return out
+    cmd = [tool]
+    if sign_key:
+        # appimagetool 用 gpg2 做分离签名，需明确密钥 ID（否则取默认密钥）
+        cmd += ["--sign", "--sign-key", sign_key]
+    cmd += [str(appdir), str(out)]
+    subprocess.run(cmd, check=True)
 
 
 def make_exe_zip(bundle_dir: Path, out: Path) -> Path:

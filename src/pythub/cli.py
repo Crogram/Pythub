@@ -46,7 +46,25 @@ def cmd_build(args) -> int:
     engine = (args.engine or "pythub").strip().lower()
     platforms = _parse_targets(args.platform, PLATFORM_FORMATS.keys(), "目标平台")
     fmts = args.format or []
-    if not fmts or fmts == ["auto"]:
+    # 内存模式（需求 23/64）:
+    # - embed: 仅支持本机平台构建，强制收敛为本机平台
+    # - mem/static: 支持跨平台（static 经 zig 目标链接平台原生构件，
+    #   Windows 经 build/core objs），保留指定平台，格式收敛为单文件
+    #   可执行（pexe/exe）
+    _mode = ("static" if getattr(args, "static", False)
+             else "embed" if getattr(args, "embed", False)
+             else "mem" if getattr(args, "mem", False) else "")
+    if _mode:
+        from pythub.exe_archive import native_host_platform
+
+        host = native_host_platform()
+        if _mode == "embed":
+            if platforms and platforms != [host]:
+                print(f"[W] --embed 仅支持本机平台构建: 目标平台已改为 {host}"
+                      "（embed 模式 dlopen PBS libpython，不做交叉）")
+            platforms = [host or platforms[0]]
+        fmts = ["exe" if p == "windows" else "pexe" for p in platforms]
+    elif not fmts or fmts == ["auto"]:
         fmts = [DEFAULT_FORMAT[p] for p in platforms]
     else:
         if engine in ("pythub", "zipapp"):
@@ -66,6 +84,9 @@ def cmd_build(args) -> int:
         "engine": args.engine,
         "windowed": args.windowed,
         "mem": getattr(args, "mem", False),
+        "mem_mode": ("static" if getattr(args, "static", False)
+                     else "embed" if getattr(args, "embed", False)
+                     else ("mem" if getattr(args, "mem", False) else "")),
         "chmod": getattr(args, "chmod", False),
         "app_wrap": getattr(args, "app_wrap", False),
         "rpm_engine": getattr(args, "rpm_engine", None),
@@ -89,6 +110,26 @@ def cmd_build(args) -> int:
                 spec.sign_cert = args.sign_cert
             if args.sign_key:
                 spec.sign_key = args.sign_key
+            if args.sign_identity:
+                spec.sign_identity = args.sign_identity
+            if args.sign_gpg_key:
+                spec.sign_gpg_key = args.sign_gpg_key
+            if args.sign_pfx:
+                spec.sign_pfx = args.sign_pfx
+            if args.sign_pfx_pass:
+                spec.sign_pfx_pass = args.sign_pfx_pass
+            if args.sign_timestamp:
+                spec.sign_timestamp = args.sign_timestamp
+            if args.entitlements:
+                spec.entitlements = args.entitlements
+            if args.notarize:
+                spec.notarize = True
+            if args.apple_id:
+                spec.apple_id = args.apple_id
+            if args.apple_password:
+                spec.apple_password = args.apple_password
+            if args.team_id:
+                spec.team_id = args.team_id
             artifacts = build(spec, logger)
             total += len(artifacts)
     logger.info("共生成 %d 个产物。", total)
@@ -277,6 +318,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mem", action="store_true",
                    help="开启 mem 内存执行模式（仅 exe/pexe）: 源码以字节码内嵌、"
                         "全程内存执行不落盘，产物后缀 .mem.exe / .mem.pexe")
+    p.add_argument("--embed", action="store_true",
+                   help="内嵌解释器模式（需求 64，仅 exe/pexe 且本机平台）: 解释器以"
+                        "动态库进程内加载（dlopen PBS 运行时的 libpython），落盘仅 "
+                        "libpython+stdlib.zip 两文件；构件全部取自 python-build-"
+                        "standalone 运行时，产物后缀 .embed.pexe")
+    p.add_argument("--static", action="store_true",
+                   help="静态内嵌模式（需求 64 第四档，仅 exe/pexe）: 解释器构建期"
+                        "静态链接进入口二进制（PBS full 变体 libpython.a），stdlib 以 "
+                        "frozen 字节码全内存执行——除 GUI 应用 tcl/tk 数据外零落盘；"
+                        "需要下载 PBS pgo-full 完整发行变体（tar.zst），产物后缀 "
+                        ".static.pexe")
     p.add_argument("--app-wrap", action="store_true",
                    help="mac 平台把 pexe 再次打包成 .app 壳（Finder 识别为应用，适合 GUI）")
     p.add_argument("--bundle-id", default=None, dest="bundle_id",
@@ -286,9 +338,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--chmod", action="store_true",
                    help="为 run/pexe/pyz 等可执行产物自动添加执行权限（chmod +x）")
     p.add_argument("--sign", action="store_true",
-                   help="给 .exe 附加 Authenticode 签名（需 osslsigncode；无证书时自动自签）")
+                   help="签名产物: .exe 用 Authenticode（需 osslsigncode；无证书时自动自签），"
+                        "macOS app/dmg/app_wrap 用 codesign（--sign-identity，空则 ad-hoc）")
     p.add_argument("--sign-cert", default=None, help="签名证书 PEM 路径（配合 --sign-key）")
     p.add_argument("--sign-key", default=None, help="签名私钥 PEM 路径（配合 --sign-cert）")
+    p.add_argument("--sign-identity", dest="sign_identity", default=None,
+                   help="macOS codesign 签名身份（需求 58，配合 --sign；空则 ad-hoc，"
+                        "pkg 不支持 ad-hoc 会跳过签名）")
+    p.add_argument("--sign-gpg-key", dest="sign_gpg_key", default=None,
+                   help="deb/rpm GPG 签名密钥 ID（需求 62，配合 --sign；空用 gpg 默认密钥，"
+                        "rpm 必须指定密钥）")
+    p.add_argument("--sign-pfx", default=None,
+                   help="PKCS#12 单文件证书 .p12/.pfx（配合 --sign；优先于 --sign-cert）")
+    p.add_argument("--sign-pfx-pass", default=None, help="PKCS#12 证书导出密码")
+    p.add_argument("--sign-timestamp", default=None,
+                   help="RFC3161 时间戳服务地址（配合 --sign，如 http://timestamp.digicert.com；"
+                        "建议正式证书填写，否则证书过期后签名失效）")
+    p.add_argument("--entitlements", default=None,
+                   help="codesign 权限声明 plist 路径（配合 --sign，macOS）")
+    p.add_argument("--notarize", action="store_true",
+                   help="macOS 产物公证并 staple（需求 65: notarytool + stapler，"
+                        "需 --apple-id/--apple-password）")
+    p.add_argument("--apple-id", default=None, help="公证用 Apple ID")
+    p.add_argument("--apple-password", default=None,
+                   help="公证用应用专用密码（appleid.apple.com 生成，非登录密码）")
+    p.add_argument("--team-id", default=None,
+                   help="公证 Team ID（账号属多个团队时必填）")
     p.add_argument("--rpm-engine", dest="rpm_engine", default=None,
                    choices=["auto", "self", "rpmbuild"],
                    help="rpm 包引擎: auto（默认，有 rpmbuild 则用之）/ self（自研，"
@@ -386,7 +461,7 @@ if __name__ == "__main__":
 
 _EXAMPLE_TOML = '''\
 [app]
-name = "hello-pythub"
+name = "hello-app"
 entry = "main.py"
 version = "0.1.0"
 description = "Pythub 示例应用"
