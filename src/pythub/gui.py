@@ -339,6 +339,8 @@ class PythubGUI:
         m_help.add_command(label="技术支持（提交问题）",
                            command=lambda: webbrowser.open(self._URL_ISSUES))
         m_help.add_separator()
+        m_help.add_command(label="开源许可",
+                           command=self._show_licenses)
         m_help.add_command(label="关于 Pythub",
                            command=lambda: self._select_tab(self.tab_about))
         menubar.add_cascade(label="帮助", menu=m_help)
@@ -2253,6 +2255,83 @@ class PythubGUI:
 
     # ------------------------------------------------ 关于页
 
+    def _show_licenses(self):
+        """需求 69: 开源许可弹窗——展示用到的开源项目/工具及许可证。
+
+        分分类展示本项目用到的开源项目和工具及其许可证信息；
+        双击条目打开对应主页/仓库。
+        """
+        from pythub.third_party import THIRD_PARTY, ACKNOWLEDGEMENT
+
+        win = tk.Toplevel(self.root)
+        win.title("开源许可")
+        win.geometry("780x520")
+        win.transient(self.root)
+        win.grab_set()
+        _center_window(win, self.root, 780, 520)
+
+        ttk.Label(
+            win,
+            text="Pythub 本体基于 BSD 3-Clause License 开源。下列项目作为打包"
+                 "产物的基础运行时，或在启用相应功能时由 Pythub 调用：Pythub 不"
+                 "修改其源码，也不随 Pythub 本体重新分发。双击条目可打开主页/仓库。",
+            foreground="#777", wraplength=740, justify="left",
+        ).pack(anchor="w", padx=14, pady=(12, 8))
+
+        ttk.Label(
+            win,
+            text="致谢",
+            font=("Helvetica", 12, "bold"),
+        ).pack(anchor="w", padx=14, pady=(0, 2))
+        ttk.Label(
+            win,
+            text=ACKNOWLEDGEMENT,
+            foreground="#8a6d3b", wraplength=740, justify="left",
+        ).pack(anchor="w", padx=14, pady=(0, 8))
+
+        box = ttk.Frame(win)
+        box.pack(expand=True, fill="both", padx=14)
+
+        tv = ttk.Treeview(box, columns=("license", "desc"), show="tree headings")
+        tv.heading("#0", text="分类 / 项目")
+        tv.column("#0", width=250, anchor="w")
+        tv.heading("license", text="许可证")
+        tv.column("license", width=200, anchor="w")
+        tv.heading("desc", text="用途")
+        tv.column("desc", width=430, anchor="w")
+        tv.tag_configure("category", font=("Helvetica", 11, "bold"))
+
+        urls: dict = {}
+        for cat, items in THIRD_PARTY:
+            cat_iid = tv.insert("", "end", text=cat, open=True,
+                                tags=("category",))
+            for name, lic, url, desc in items:
+                iid = tv.insert(cat_iid, "end", text=name,
+                                values=(lic, desc))
+                if url:
+                    urls[iid] = url
+
+        sb = ttk.Scrollbar(box, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        tv.pack(side="left", expand=True, fill="both")
+
+        def _open_link(_event):
+            iid = tv.focus()
+            url = urls.get(iid)
+            if url:
+                self._open_url(url)
+
+        tv.bind("<Double-1>", _open_link)
+        tv.bind("<Return>", _open_link)
+
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=14, pady=(6, 12))
+        ttk.Label(bar, text="提示: 运行时产物中第三方库的完整许可证文本随"
+                            " python-build-standalone 产物一同分发。",
+                  foreground="#999").pack(side="left")
+        ttk.Button(bar, text="关闭", command=win.destroy).pack(side="right")
+
     def _build_tab_about(self):
         import platform
 
@@ -2290,6 +2369,8 @@ class PythubGUI:
         row("开源协议", "BSD 3-Clause License")
         row("版权所有", f"Copyright © {__author__}")
         ttk.Label(wrap, text="开源组织 CROGRAM 出品", foreground="#999").pack(pady=18)
+        ttk.Button(wrap, text="开源许可",
+                   command=self._show_licenses).pack(pady=(0, 16))
 
     def _open_url(self, url: str):
         import subprocess
